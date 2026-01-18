@@ -1,0 +1,21 @@
+{
+  "name": "ROALS Exporter A",
+  "slug": "exporter_a",
+  "description": "Deterministischer Daily-JSON Exporter (Exporter A)",
+  "version": "0.1.0",
+  "arch": ["amd64", "aarch64"],
+  "startup": "services",
+  "boot": "auto",
+  "init": false,
+  "map": ["share:rw"],
+  "options": {
+    "data_root": "/share/nara_data",
+    "timezone": "Asia/Manila",
+    "log_level": "INFO"
+  },
+  "schema": {
+    "data_root": "str",
+    "timezone": "str",
+    "log_level": "list(INFO|DEBUG|WARNING|ERROR)"
+  }
+}
