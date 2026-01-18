@@ -12,10 +12,12 @@
     "data_root": "/share/nara_data",
     "timezone": "Asia/Manila",
     "log_level": "INFO"
+    "run_mode": "skeleton"
   },
   "schema": {
     "data_root": "str",
     "timezone": "str",
     "log_level": "list(INFO|DEBUG|WARNING|ERROR)"
+    "run_mode": "list(skeleton|oneshot_today)"
   }
 }
