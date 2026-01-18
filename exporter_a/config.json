@@ -8,16 +8,18 @@
   "boot": "auto",
   "init": false,
   "map": ["share:rw"],
+
   "options": {
     "data_root": "/share/nara_data",
     "timezone": "Asia/Manila",
     "log_level": "INFO",
     "run_mode": "skeleton"
   },
+
   "schema": {
     "data_root": "str",
     "timezone": "str",
-    "log_level": "list(INFO|DEBUG|WARNING|ERROR)",
-    "run_mode": "list(skeleton|oneshot_today)"
+    "log_level": "match(INFO|DEBUG|WARNING|ERROR)",
+    "run_mode": "match(skeleton|oneshot_today)"
   }
 }
