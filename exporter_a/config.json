@@ -2,7 +2,7 @@
   "name": "ROALS Exporter A",
   "slug": "exporter_a",
   "description": "Deterministischer Daily-JSON Exporter (Exporter A)",
-  "version": "0.1.4",
+  "version": "0.1.6",
   "arch": ["amd64", "aarch64"],
   "startup": "services",
   "boot": "manual",
@@ -14,6 +14,7 @@
     "log_level": "INFO",
     "run_mode": "skeleton",
     "target_date": "",
+    "exporter_domain": "system",
     "entities": []
   },
   "schema": {
@@ -22,6 +23,7 @@
     "log_level": "list(INFO|DEBUG|WARNING|ERROR)",
     "run_mode": "list(skeleton|oneshot_today|oneshot_date)",
     "target_date": "str?",
+    "exporter_domain": "list(system|network|internet|events|climate_og|climate_eg|weather|energy|prices|budget|security|motion|cameras)",
     "entities": ["str"]
   }
 }
