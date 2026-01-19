@@ -1,4 +1,4 @@
-FROM python:3.11-slim
+FROM python:3.11.10-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
@@ -10,7 +10,5 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 COPY app/ /app/
-
-RUN pip install --no-cache-dir requests python-dateutil
 
 CMD ["python", "-u", "/app/exporter.py"]
