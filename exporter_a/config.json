@@ -1,12 +1,11 @@
 {
   "name": "ROALS Exporter A",
+  "version": "0.2.0",
   "slug": "exporter_a",
-  "description": "Deterministischer Daily-JSON Exporter (Exporter A)",
-  "version": "0.1.6",
+  "description": "ROALS Exporter A (Truth Layer) – deterministic daily JSON skeleton exporter",
   "arch": ["amd64", "aarch64"],
   "startup": "services",
   "boot": "manual",
-  "init": false,
   "map": ["share:rw"],
   "options": {
     "data_root": "/share/nara_data",
@@ -15,15 +14,20 @@
     "run_mode": "skeleton",
     "target_date": "",
     "exporter_domain": "system",
+    "registry_path": "/share/nara_data/registry/entity_registry.json",
+    "strict_registry": true,
     "entities": []
   },
   "schema": {
     "data_root": "str",
     "timezone": "str",
-    "log_level": "list(INFO|DEBUG|WARNING|ERROR)",
-    "run_mode": "list(skeleton|oneshot_today|oneshot_date)",
+    "log_level": "list(DEBUG|INFO|WARNING|ERROR)",
+    "run_mode": "list(skeleton|oneshot_today|oneshot_date|daily_all_domains)",
     "target_date": "str?",
-    "exporter_domain": "list(system|network|internet|events|climate_og|climate_eg|weather|energy|prices|budget|security|motion|cameras)",
+    "exporter_domain": "list(budget|cameras|climate_eg|climate_og|energy|events|internet|motion|network|prices|security|system|weather)",
+    "registry_path": "str?",
+    "strict_registry": "bool",
     "entities": ["str"]
   }
 }
+```0
