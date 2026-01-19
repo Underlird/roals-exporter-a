@@ -5,7 +5,6 @@
   "description": "ROALS Exporter A (Truth Layer) – deterministic daily JSON skeleton exporter",
   "arch": ["amd64", "aarch64"],
   "startup": "services",
-  "boot": "manual",
   "map": ["share:rw"],
   "options": {
     "data_root": "/share/nara_data",
@@ -30,4 +29,3 @@
     "entities": ["str"]
   }
 }
-```0
