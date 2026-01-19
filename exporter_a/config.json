@@ -2,10 +2,10 @@
   "name": "ROALS Exporter A",
   "slug": "exporter_a",
   "description": "Deterministischer Daily-JSON Exporter (Exporter A)",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "arch": ["amd64", "aarch64"],
   "startup": "services",
-  "boot": "auto",
+  "boot": "manual",
   "init": false,
   "map": ["share:rw"],
   "options": {
