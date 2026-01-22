@@ -77,7 +77,7 @@ class Settings:
 # ----------------------------
 # Data Sampling (Truth Extraction)
 # ----------------------------
-deffetch _h_ha_history(entity_ids: List[str], day: dt.date, tz: ZoneInfo, cfg_level: str) -> Dict[str, List[Dict]]:
+def fetch_ha_history(entity_ids: List[str], day: dt.date, tz: ZoneInfo, cfg_level: str) -> Dict[str, List[Dict]]:
     token = os.environ.get("SUPERVISOR_TOKEN")
     if not token:
         log("ERROR", "SUPERVISOR_TOKEN fehlt! API-Zugriff unmöglich.", cfg_level)
