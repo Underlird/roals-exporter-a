@@ -44,7 +44,6 @@ Run-Modes: skeleton, oneshot_domain, oneshot_all_domains, daily_all_domains
 Features: Batch-Mode für Datumsbereich-Export (start_date bis end_date)
 Garantien: Atomic Write, fsync Durability, Deterministic Hashing, LKS Sampling
 """
-
 from __future__ import annotations
 import datetime as dt
 import hashlib
