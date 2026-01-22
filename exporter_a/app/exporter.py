@@ -110,60 +110,77 @@ def fetch_ha_history(entity_ids: List[str], day: dt.date, tz: ZoneInfo, cfg_leve
     
     log("DEBUG", f"History API Request (entity_ids: {len(entity_ids)})", cfg_level)
     
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
+try:
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+        
+        # Debug: Response-Struktur
+        log("DEBUG", f"Response structure: type={type(data)}, len={len(data) if isinstance(data, list) else 'N/A'}", cfg_level)
+        
+        # Debug: Gesamtanzahl
+        total_items = sum(len(entity_list) for entity_list in data if isinstance(entity_list, list))
+        log("DEBUG", f"History API Response: {total_items} total items", cfg_level)
+        
+        # Debug: Erste Liste im Response
+        if data and len(data) > 0:
+            first_list = data[0]
+            log("DEBUG", f"First list: type={type(first_list)}, len={len(first_list) if isinstance(first_list, list) else 'N/A'}", cfg_level)
             
-            # Debug: Gesamtanzahl
-            total_items = sum(len(entity_list) for entity_list in data if isinstance(entity_list, list))
-            log("DEBUG", f"History API Response: {total_items} total items", cfg_level)
-            
-            # Debug: Erste Entity ID in Response zeigen
-            if data and len(data) > 0 and len(data[0]) > 0:
-                first_event = data[0][0]
+            if isinstance(first_list, list) and len(first_list) > 0:
+                first_event = first_list[0]
                 sample_eid = first_event.get("entity_id", "N/A")
                 log("DEBUG", f"Sample entity_id from API: '{sample_eid}'", cfg_level)
                 if entity_ids:
                     log("DEBUG", f"Expected entity_id: '{entity_ids[0]}'", cfg_level)
+        
+        # Normalisierte Lookup-Map
+        normalized_map = {}
+        for eid in entity_ids:
+            normalized_key = eid.strip().lower()
+            normalized_map[normalized_key] = eid
+        
+        log("DEBUG", f"Normalized map has {len(normalized_map)} entries", cfg_level)
+        
+        history_map = {eid: [] for eid in entity_ids}
+        matched_count = 0
+        unmatched_count = 0
+        
+        # KRITISCH: Iteration über verschachtelte Liste
+        for entity_list in data:
+            log("DEBUG", f"Processing entity_list with {len(entity_list)} items", cfg_level)
             
-            # Normalisierte Lookup-Map für robustes Matching
-            normalized_map = {}
-            for eid in entity_ids:
-                normalized_key = eid.strip().lower()
-                normalized_map[normalized_key] = eid
+            for event in entity_list:
+                eid_raw = event.get("entity_id")
+                if eid_raw:
+                    eid_normalized = eid_raw.strip().lower()
+                    
+                    # Debug: Zeige Matching-Versuch für erstes Event
+                    if matched_count == 0 and unmatched_count == 0:
+                        log("DEBUG", f"First event: eid_raw='{eid_raw}', normalized='{eid_normalized}'", cfg_level)
+                        log("DEBUG", f"In normalized_map? {eid_normalized in normalized_map}", cfg_level)
+                    
+                    if eid_normalized in normalized_map:
+                        original_eid = normalized_map[eid_normalized]
+                        history_map[original_eid].append(event)
+                        matched_count += 1
+                    else:
+                        unmatched_count += 1
+                        if unmatched_count == 1:
+                            log("DEBUG", f"Unmatched entity_id: '{eid_raw}'", cfg_level)
+        
+        log("DEBUG", f"Matched: {matched_count}, Unmatched: {unmatched_count}", cfg_level)
+        
+        # Debug: Pro Entity
+        for eid, events in history_map.items():
+            log("DEBUG", f"Entity {eid}: {len(events)} Events geladen.", cfg_level)
             
-            history_map = {eid: [] for eid in entity_ids}
-            matched_count = 0
-            unmatched_count = 0
+        return history_map
             
-            for entity_list in data:
-                for event in entity_list:
-                    eid_raw = event.get("entity_id")
-                    if eid_raw:
-                        eid_normalized = eid_raw.strip().lower()
-                        if eid_normalized in normalized_map:
-                            original_eid = normalized_map[eid_normalized]
-                            history_map[original_eid].append(event)
-                            matched_count += 1
-                        else:
-                            unmatched_count += 1
-                            # Log erste unmatched Entity ID
-                            if unmatched_count == 1:
-                                log("DEBUG", f"Unmatched entity_id: '{eid_raw}'", cfg_level)
-            
-            log("DEBUG", f"Matched: {matched_count}, Unmatched: {unmatched_count}", cfg_level)
-            
-            # Debug: Pro Entity
-            for eid, events in history_map.items():
-                log("DEBUG", f"Entity {eid}: {len(events)} Events geladen.", cfg_level)
-                
-            return history_map
-                
-    except Exception as e:
-        log("ERROR", f"History API Fehler: {e}", cfg_level)
-        import traceback
-        traceback.print_exc()
-        return {}
+except Exception as e:
+    log("ERROR", f"History API Fehler: {e}", cfg_level)
+    import traceback
+    traceback.print_exc()
+    return {}
 
 def map_history_to_slots(ts_iso: List[str], history: List[Dict]) -> List[Any]:
     """
