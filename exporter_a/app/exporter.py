@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
 ROALS Exporter A (Truth Layer) — LKS FINAL PRODUCTION READY
-Version: 2026.1.4-lks (Freeze 2026)
+Version: 2026.1.5-lks (Debug Edition)
 
-Status: PRODUCTION-READY
+Status: PRODUCTION-READY mit Debug-Logging
 Garantien: Atomic Write, fsync Durability, Collision Guard, 
            Deterministic Hashing, Last-Known-State Sampling.
 """
@@ -29,7 +29,7 @@ except Exception:
 # ----------------------------
 # Constants & Contract
 # ----------------------------
-EXPORTER_VERSION = "2026.1.4-lks"
+EXPORTER_VERSION = "2026.1.5-lks"
 RASTER_MINUTES = 5
 SLOTS_PER_DAY = 288
 ALLOWED_DOMAINS = [
@@ -78,6 +78,10 @@ class Settings:
 # Data Sampling (Truth Extraction)
 # ----------------------------
 def fetch_ha_history(entity_ids: List[str], day: dt.date, tz: ZoneInfo, cfg_level: str) -> Dict[str, List[Dict]]:
+    """
+    Holt History-Daten von HA Supervisor API.
+    KRITISCH: significant_changes_only=0 um alle Events zu bekommen.
+    """
     token = os.environ.get("SUPERVISOR_TOKEN")
     if not token:
         log("ERROR", "SUPERVISOR_TOKEN fehlt! API-Zugriff unmöglich.", cfg_level)
@@ -89,19 +93,22 @@ def fetch_ha_history(entity_ids: List[str], day: dt.date, tz: ZoneInfo, cfg_leve
     start_iso = start_dt.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
     end_iso = end_dt.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
     
-    # KRITISCHE ÄNDERUNG: Strings statt Booleans
+    # KRITISCHE PARAMETER: Strings statt Booleans
     params = {
         "filter_entity_id": ",".join(entity_ids),
         "end_time": end_iso,
-        "minimal_response": "0",              # String "0" statt Boolean False
-        "no_attributes": "1",                 # String "1" statt Boolean True
-        "significant_changes_only": "0"       # String "0" - dieser fehlte komplett
+        "minimal_response": "0",
+        "no_attributes": "1",
+        "significant_changes_only": "0"
     }
     
     url = f"http://supervisor/core/api/history/period/{urllib.parse.quote(start_iso)}?{urllib.parse.urlencode(params)}"
-    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+    req = urllib.request.Request(url, headers={
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    })
     
-    log("DEBUG", f"History API Request URL (ohne Token)", cfg_level)
+    log("DEBUG", f"History API Request (entity_ids: {len(entity_ids)})", cfg_level)
     
     try:
         with urllib.request.urlopen(req, timeout=60) as resp:
@@ -111,24 +118,57 @@ def fetch_ha_history(entity_ids: List[str], day: dt.date, tz: ZoneInfo, cfg_leve
             total_items = sum(len(entity_list) for entity_list in data if isinstance(entity_list, list))
             log("DEBUG", f"History API Response: {total_items} total items", cfg_level)
             
+            # Debug: Erste Entity ID in Response zeigen
+            if data and len(data) > 0 and len(data[0]) > 0:
+                first_event = data[0][0]
+                sample_eid = first_event.get("entity_id", "N/A")
+                log("DEBUG", f"Sample entity_id from API: '{sample_eid}'", cfg_level)
+                if entity_ids:
+                    log("DEBUG", f"Expected entity_id: '{entity_ids[0]}'", cfg_level)
+            
+            # Normalisierte Lookup-Map für robustes Matching
+            normalized_map = {}
+            for eid in entity_ids:
+                normalized_key = eid.strip().lower()
+                normalized_map[normalized_key] = eid
+            
             history_map = {eid: [] for eid in entity_ids}
+            matched_count = 0
+            unmatched_count = 0
+            
             for entity_list in data:
                 for event in entity_list:
-                    eid = event.get("entity_id")
-                    if eid in history_map:
-                        history_map[eid].append(event)
+                    eid_raw = event.get("entity_id")
+                    if eid_raw:
+                        eid_normalized = eid_raw.strip().lower()
+                        if eid_normalized in normalized_map:
+                            original_eid = normalized_map[eid_normalized]
+                            history_map[original_eid].append(event)
+                            matched_count += 1
+                        else:
+                            unmatched_count += 1
+                            # Log erste unmatched Entity ID
+                            if unmatched_count == 1:
+                                log("DEBUG", f"Unmatched entity_id: '{eid_raw}'", cfg_level)
+            
+            log("DEBUG", f"Matched: {matched_count}, Unmatched: {unmatched_count}", cfg_level)
             
             # Debug: Pro Entity
             for eid, events in history_map.items():
                 log("DEBUG", f"Entity {eid}: {len(events)} Events geladen.", cfg_level)
                 
             return history_map
-            
+                
     except Exception as e:
         log("ERROR", f"History API Fehler: {e}", cfg_level)
+        import traceback
+        traceback.print_exc()
         return {}
 
 def map_history_to_slots(ts_iso: List[str], history: List[Dict]) -> List[Any]:
+    """
+    LKS-Sampling: Last Known State für jeden Slot.
+    """
     events = []
     for h in history:
         t_str = h.get("last_updated") or h.get("last_changed")
@@ -160,12 +200,15 @@ def map_history_to_slots(ts_iso: List[str], history: List[Dict]) -> List[Any]:
 # ----------------------------
 
 def entity_to_column_key(entity_id: str) -> str:
+    """Konvertiert Entity ID in sicheren Spaltennamen."""
     s = entity_id.strip().lower()
     s = re.sub(r"[^a-z0-9]+", "_", s)
     return re.sub(r"_+", "_", s).strip("_")
 
 def build_daily_payload(domain: str, day: dt.date, tz: ZoneInfo, entities: List[str], cfg_level: str) -> Dict[str, Any]:
-    # Slots werden IMMER in Manila-Zeit deklariert (ROALS Standard)
+    """
+    Baut das tägliche JSON-Payload mit 288 Slots.
+    """
     start_dt = dt.datetime(day.year, day.month, day.day, 0, 0, 0, tzinfo=tz)
     ts_iso = [(start_dt + dt.timedelta(minutes=RASTER_MINUTES * i)).isoformat() for i in range(SLOTS_PER_DAY)]
     
@@ -177,19 +220,22 @@ def build_daily_payload(domain: str, day: dt.date, tz: ZoneInfo, entities: List[
     
     for eid in sorted(entities):
         base_key = entity_to_column_key(eid)
-        col_key = f"{base_key}_{hashlib.sha256(eid.encode()).hexdigest()[:8]}" if base_key in col_counts else base_key
+        if base_key in col_counts:
+            col_key = f"{base_key}_{hashlib.sha256(eid.encode()).hexdigest()[:8]}"
+        else:
+            col_key = base_key
         col_counts[base_key] = True
         
         columns_source_map[col_key] = {"ha_entity_id": eid}
         timeseries[col_key] = map_history_to_slots(ts_iso, history_map.get(eid, []))
         
     payload = {
-        "events": [], # ROALS Contract Konsistenz
+        "events": [],
         "meta": {
             "version": EXPORTER_VERSION, 
             "domain": domain, 
             "date": day.isoformat(),
-            "timezone": "Asia/Manila", # Anchor Timezone
+            "timezone": str(tz),
             "generated_at": dt.datetime.now(tz=tz).isoformat(),
             "columns_source_map": columns_source_map, 
             "integrity_hash": ""
@@ -197,6 +243,7 @@ def build_daily_payload(domain: str, day: dt.date, tz: ZoneInfo, entities: List[
         "timeseries": timeseries
     }
     
+    # Deterministic Hashing
     cloned = copy.deepcopy(payload)
     cloned["meta"]["integrity_hash"] = ""
     s = json.dumps(cloned, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
@@ -215,6 +262,8 @@ def main() -> int:
         tz = ZoneInfo(cfg.timezone)
         day = dt.date.fromisoformat(cfg.target_date) if cfg.target_date else dt.datetime.now(tz=tz).date()
         
+        log("INFO", f"Exporter {EXPORTER_VERSION} startet: Mode={cfg.run_mode}, Day={day}, TZ={cfg.timezone}", cfg.log_level)
+        
         if cfg.run_mode == "skeleton":
             log("INFO", "Skeleton Mode beendet.", cfg.log_level)
             return 0
@@ -227,13 +276,18 @@ def main() -> int:
         entities_to_use = cfg.entities
         
         for dom in domains:
-            if not dom: continue
+            if not dom:
+                continue
+                
             out_path = os.path.join(cfg.data_root, str(day.year), f"{day.month:02d}", f"{day.isoformat()}_{dom}.json")
+            
             if os.path.exists(out_path):
                 log("WARNING", f"Datei existiert bereits: {out_path}", cfg.log_level)
                 continue
                 
             os.makedirs(os.path.dirname(out_path), exist_ok=True)
+            
+            log("INFO", f"Generiere Payload für {dom} ({len(entities_to_use)} Entities)...", cfg.log_level)
             payload = build_daily_payload(dom, day, tz, entities_to_use, cfg.log_level)
             
             # Atomic Write mit fsync Durability
@@ -251,11 +305,13 @@ def main() -> int:
                     os.fsync(dir_fd)
                 finally:
                     os.close(dir_fd)
-            except OSError: pass
+            except OSError:
+                pass
 
             log("INFO", f"SUCCESS: {out_path} ({len(entities_to_use)} Entities)", cfg.log_level)
 
         return 0
+        
     except Exception as e:
         log("ERROR", f"CRASH: {e}", "INFO")
         import traceback
@@ -264,3 +320,21 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+```
+
+## Hauptänderungen zum vorherigen Code
+
+1. **Syntax-Fehler behoben** - Zeile 107: Korrekte Einrückung des `try`-Blocks
+2. **Robustes Entity-Matching** - Zeile 145-160: Normalisiertes Matching (case-insensitive, trimmed)
+3. **Vollständiges Debug-Logging** - Zeilen 129-167: Matched/Unmatched Counts
+4. **Timezone-Metadata korrigiert** - Zeile 237: `str(tz)` statt hard-coded "Asia/Manila"
+5. **Version erhöht** - Version 2026.1.5-lks (Debug Edition)
+
+## Nach dem Deploy erwarte ich
+```
+[DEBUG] History API Response: 5922 total items
+[DEBUG] Sample entity_id from API: 'sensor.0xd4fe28fffee1466d_humidity'
+[DEBUG] Expected entity_id: 'sensor.0xd4fe28fffee1466d_humidity'
+[DEBUG] Matched: 5922, Unmatched: 0
+[DEBUG] Entity sensor.0xd4fe28fffee1466d_humidity: 5922 Events geladen.
+[INFO] SUCCESS: /share/nara_data/2026/01/2026-01-21_climate_og.json (1 Entities)
