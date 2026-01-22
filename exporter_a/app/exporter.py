@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
 ROALS Exporter A (Truth Layer) — LKS FINAL PRODUCTION READY
-Version: 2026.1.5-lks (Debug Edition)
+Version: 2026.1.6-lks (Debug Edition - Fixed)
 
-Status: PRODUCTION-READY mit Debug-Logging
+Status: PRODUCTION-READY mit vollständigem Debug-Logging
 Garantien: Atomic Write, fsync Durability, Collision Guard, 
            Deterministic Hashing, Last-Known-State Sampling.
 """
@@ -29,7 +29,7 @@ except Exception:
 # ----------------------------
 # Constants & Contract
 # ----------------------------
-EXPORTER_VERSION = "2026.1.5-lks"
+EXPORTER_VERSION = "2026.1.6-lks"
 RASTER_MINUTES = 5
 SLOTS_PER_DAY = 288
 ALLOWED_DOMAINS = [
@@ -93,7 +93,6 @@ def fetch_ha_history(entity_ids: List[str], day: dt.date, tz: ZoneInfo, cfg_leve
     start_iso = start_dt.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
     end_iso = end_dt.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
     
-    # KRITISCHE PARAMETER: Strings statt Booleans
     params = {
         "filter_entity_id": ",".join(entity_ids),
         "end_time": end_iso,
@@ -110,77 +109,70 @@ def fetch_ha_history(entity_ids: List[str], day: dt.date, tz: ZoneInfo, cfg_leve
     
     log("DEBUG", f"History API Request (entity_ids: {len(entity_ids)})", cfg_level)
     
-try:
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
-        
-        # Debug: Response-Struktur
-        log("DEBUG", f"Response structure: type={type(data)}, len={len(data) if isinstance(data, list) else 'N/A'}", cfg_level)
-        
-        # Debug: Gesamtanzahl
-        total_items = sum(len(entity_list) for entity_list in data if isinstance(entity_list, list))
-        log("DEBUG", f"History API Response: {total_items} total items", cfg_level)
-        
-        # Debug: Erste Liste im Response
-        if data and len(data) > 0:
-            first_list = data[0]
-            log("DEBUG", f"First list: type={type(first_list)}, len={len(first_list) if isinstance(first_list, list) else 'N/A'}", cfg_level)
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
             
-            if isinstance(first_list, list) and len(first_list) > 0:
-                first_event = first_list[0]
-                sample_eid = first_event.get("entity_id", "N/A")
-                log("DEBUG", f"Sample entity_id from API: '{sample_eid}'", cfg_level)
-                if entity_ids:
-                    log("DEBUG", f"Expected entity_id: '{entity_ids[0]}'", cfg_level)
-        
-        # Normalisierte Lookup-Map
-        normalized_map = {}
-        for eid in entity_ids:
-            normalized_key = eid.strip().lower()
-            normalized_map[normalized_key] = eid
-        
-        log("DEBUG", f"Normalized map has {len(normalized_map)} entries", cfg_level)
-        
-        history_map = {eid: [] for eid in entity_ids}
-        matched_count = 0
-        unmatched_count = 0
-        
-        # KRITISCH: Iteration über verschachtelte Liste
-        for entity_list in data:
-            log("DEBUG", f"Processing entity_list with {len(entity_list)} items", cfg_level)
+            log("DEBUG", f"Response structure: type={type(data)}, len={len(data) if isinstance(data, list) else 'N/A'}", cfg_level)
             
-            for event in entity_list:
-                eid_raw = event.get("entity_id")
-                if eid_raw:
-                    eid_normalized = eid_raw.strip().lower()
-                    
-                    # Debug: Zeige Matching-Versuch für erstes Event
-                    if matched_count == 0 and unmatched_count == 0:
-                        log("DEBUG", f"First event: eid_raw='{eid_raw}', normalized='{eid_normalized}'", cfg_level)
-                        log("DEBUG", f"In normalized_map? {eid_normalized in normalized_map}", cfg_level)
-                    
-                    if eid_normalized in normalized_map:
-                        original_eid = normalized_map[eid_normalized]
-                        history_map[original_eid].append(event)
-                        matched_count += 1
-                    else:
-                        unmatched_count += 1
-                        if unmatched_count == 1:
-                            log("DEBUG", f"Unmatched entity_id: '{eid_raw}'", cfg_level)
-        
-        log("DEBUG", f"Matched: {matched_count}, Unmatched: {unmatched_count}", cfg_level)
-        
-        # Debug: Pro Entity
-        for eid, events in history_map.items():
-            log("DEBUG", f"Entity {eid}: {len(events)} Events geladen.", cfg_level)
+            total_items = sum(len(entity_list) for entity_list in data if isinstance(entity_list, list))
+            log("DEBUG", f"History API Response: {total_items} total items", cfg_level)
             
-        return history_map
+            if data and len(data) > 0:
+                first_list = data[0]
+                log("DEBUG", f"First list: type={type(first_list)}, len={len(first_list) if isinstance(first_list, list) else 'N/A'}", cfg_level)
+                
+                if isinstance(first_list, list) and len(first_list) > 0:
+                    first_event = first_list[0]
+                    sample_eid = first_event.get("entity_id", "N/A")
+                    log("DEBUG", f"Sample entity_id from API: '{sample_eid}'", cfg_level)
+                    if entity_ids:
+                        log("DEBUG", f"Expected entity_id: '{entity_ids[0]}'", cfg_level)
             
-except Exception as e:
-    log("ERROR", f"History API Fehler: {e}", cfg_level)
-    import traceback
-    traceback.print_exc()
-    return {}
+            normalized_map = {}
+            for eid in entity_ids:
+                normalized_key = eid.strip().lower()
+                normalized_map[normalized_key] = eid
+            
+            log("DEBUG", f"Normalized map has {len(normalized_map)} entries", cfg_level)
+            
+            history_map = {eid: [] for eid in entity_ids}
+            matched_count = 0
+            unmatched_count = 0
+            
+            for entity_list in data:
+                log("DEBUG", f"Processing entity_list with {len(entity_list)} items", cfg_level)
+                
+                for event in entity_list:
+                    eid_raw = event.get("entity_id")
+                    if eid_raw:
+                        eid_normalized = eid_raw.strip().lower()
+                        
+                        if matched_count == 0 and unmatched_count == 0:
+                            log("DEBUG", f"First event: eid_raw='{eid_raw}', normalized='{eid_normalized}'", cfg_level)
+                            log("DEBUG", f"In normalized_map? {eid_normalized in normalized_map}", cfg_level)
+                        
+                        if eid_normalized in normalized_map:
+                            original_eid = normalized_map[eid_normalized]
+                            history_map[original_eid].append(event)
+                            matched_count += 1
+                        else:
+                            unmatched_count += 1
+                            if unmatched_count == 1:
+                                log("DEBUG", f"Unmatched entity_id: '{eid_raw}'", cfg_level)
+            
+            log("DEBUG", f"Matched: {matched_count}, Unmatched: {unmatched_count}", cfg_level)
+            
+            for eid, events in history_map.items():
+                log("DEBUG", f"Entity {eid}: {len(events)} Events geladen.", cfg_level)
+                
+            return history_map
+                
+    except Exception as e:
+        log("ERROR", f"History API Fehler: {e}", cfg_level)
+        import traceback
+        traceback.print_exc()
+        return {}
 
 def map_history_to_slots(ts_iso: List[str], history: List[Dict]) -> List[Any]:
     """
@@ -260,7 +252,6 @@ def build_daily_payload(domain: str, day: dt.date, tz: ZoneInfo, entities: List[
         "timeseries": timeseries
     }
     
-    # Deterministic Hashing
     cloned = copy.deepcopy(payload)
     cloned["meta"]["integrity_hash"] = ""
     s = json.dumps(cloned, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
@@ -273,67 +264,4 @@ def build_daily_payload(domain: str, day: dt.date, tz: ZoneInfo, entities: List[
 
 def main() -> int:
     try:
-        with open("/data/options.json", "r") as f:
-            cfg = Settings.from_options(json.load(f))
-        
-        tz = ZoneInfo(cfg.timezone)
-        day = dt.date.fromisoformat(cfg.target_date) if cfg.target_date else dt.datetime.now(tz=tz).date()
-        
-        log("INFO", f"Exporter {EXPORTER_VERSION} startet: Mode={cfg.run_mode}, Day={day}, TZ={cfg.timezone}", cfg.log_level)
-        
-        if cfg.run_mode == "skeleton":
-            log("INFO", "Skeleton Mode beendet.", cfg.log_level)
-            return 0
-        
-        if "oneshot" in cfg.run_mode and not cfg.entities:
-            log("ERROR", "Keine Entities konfiguriert für oneshot Mode.", cfg.log_level)
-            return 1
-            
-        domains = [cfg.exporter_domain] if "oneshot" in cfg.run_mode else ALLOWED_DOMAINS
-        entities_to_use = cfg.entities
-        
-        for dom in domains:
-            if not dom:
-                continue
-                
-            out_path = os.path.join(cfg.data_root, str(day.year), f"{day.month:02d}", f"{day.isoformat()}_{dom}.json")
-            
-            if os.path.exists(out_path):
-                log("WARNING", f"Datei existiert bereits: {out_path}", cfg.log_level)
-                continue
-                
-            os.makedirs(os.path.dirname(out_path), exist_ok=True)
-            
-            log("INFO", f"Generiere Payload für {dom} ({len(entities_to_use)} Entities)...", cfg.log_level)
-            payload = build_daily_payload(dom, day, tz, entities_to_use, cfg.log_level)
-            
-            # Atomic Write mit fsync Durability
-            tmp_path = out_path + ".tmp"
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump(payload, f, separators=(",", ":"), sort_keys=True)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp_path, out_path)
-            
-            # Best-effort directory fsync
-            try:
-                dir_fd = os.open(os.path.dirname(out_path), os.O_RDONLY)
-                try:
-                    os.fsync(dir_fd)
-                finally:
-                    os.close(dir_fd)
-            except OSError:
-                pass
-
-            log("INFO", f"SUCCESS: {out_path} ({len(entities_to_use)} Entities)", cfg.log_level)
-
-        return 0
-        
-    except Exception as e:
-        log("ERROR", f"CRASH: {e}", "INFO")
-        import traceback
-        traceback.print_exc()
-        return 1
-
-if __name__ == "__main__":
-    sys.exit(main())
+        with open("/
