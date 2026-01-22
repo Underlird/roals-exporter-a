@@ -320,21 +320,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-```
-
-## Hauptänderungen zum vorherigen Code
-
-1. **Syntax-Fehler behoben** - Zeile 107: Korrekte Einrückung des `try`-Blocks
-2. **Robustes Entity-Matching** - Zeile 145-160: Normalisiertes Matching (case-insensitive, trimmed)
-3. **Vollständiges Debug-Logging** - Zeilen 129-167: Matched/Unmatched Counts
-4. **Timezone-Metadata korrigiert** - Zeile 237: `str(tz)` statt hard-coded "Asia/Manila"
-5. **Version erhöht** - Version 2026.1.5-lks (Debug Edition)
-
-## Nach dem Deploy erwarte ich
-```
-[DEBUG] History API Response: 5922 total items
-[DEBUG] Sample entity_id from API: 'sensor.0xd4fe28fffee1466d_humidity'
-[DEBUG] Expected entity_id: 'sensor.0xd4fe28fffee1466d_humidity'
-[DEBUG] Matched: 5922, Unmatched: 0
-[DEBUG] Entity sensor.0xd4fe28fffee1466d_humidity: 5922 Events geladen.
-[INFO] SUCCESS: /share/nara_data/2026/01/2026-01-21_climate_og.json (1 Entities)
