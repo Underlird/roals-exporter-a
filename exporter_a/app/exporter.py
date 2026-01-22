@@ -34,7 +34,6 @@
     "registry_path": "str"
   }
 }
-exporter.py (Vereinfachte Logs)
 #!/usr/bin/env python3
 """
 ROALS Exporter A (Truth Layer) — Registry-First Production Release
