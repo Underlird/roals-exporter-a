@@ -2,7 +2,7 @@
 """
 ROALS Exporter A (Truth Layer) — Platinum Batch Edition
 Version: 2026.1.14-lks
-Changelog: Reduced UI, Hardcoded Infrastructure, Enum-Routing, Enhanced Safety.
+Changelog: UI-Validation Fix, Hardcoded Paths, Batch Optimization.
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ except ImportError:
         sys.exit(2)
 
 # --- ROALS Manila Infrastructure Constants ---
-# Diese Pfade sind nun fest im System verankert (Single Source of Truth)
+# Festgelegte Pfade für PC 1 (Manila)
 DATA_ROOT = "/share/nara_data"
 REGISTRY_PATH = "/share/nara_data/registry/entity_registry.json"
 DEFAULT_TIMEZONE = "Asia/Manila"
@@ -68,7 +68,7 @@ class Settings:
         
         exp_dom = opts.get("exporter_domain")
         if mode == "daily_one_domain" and not exp_dom:
-            raise ValueError("Modus 'daily_one_domain' erfordert eine 'exporter_domain'.")
+            raise ValueError("Modus 'daily_one_domain' erfordert die Auswahl einer Domain.")
 
         return Settings(
             log_level=log_lvl,
@@ -208,7 +208,7 @@ def main() -> int:
         
         if cfg.run_mode == "skeleton": return 0
         
-        # Domain Filterung
+        # Modus-Entscheidung
         if cfg.run_mode == "daily_all_domains":
             domains = sorted(ALLOWED_DOMAINS)
         else: # daily_one_domain
@@ -219,7 +219,7 @@ def main() -> int:
         for dom in domains:
             if not dom: continue
             try:
-                # Routing via Registry
+                # Routing über die Registry
                 active = {eid: m for eid, m in reg.items() if m.get("exporter_domain") == dom and entity_is_active(m, day)}
                 
                 if not active:
@@ -229,7 +229,7 @@ def main() -> int:
                 if os.path.exists(out):
                     stats["skipped_exists"] += 1; continue
 
-                log("INFO", f"Exportiere {dom}...", cfg.log_level)
+                log("INFO", f"Exportiere {dom} ({len(active)} Entities)...", cfg.log_level)
                 payload = build_daily_payload(dom, day, active, cfg.log_level)
                 
                 os.makedirs(os.path.dirname(out), exist_ok=True)
@@ -238,6 +238,11 @@ def main() -> int:
                     json.dump(payload, f, separators=(",", ":"), sort_keys=True)
                     f.flush(); os.fsync(f.fileno())
                 os.replace(tmp, out)
+                
+                # Sanity Check
+                if os.path.getsize(out) < 1024:
+                    log("WARNING", f"Datei verdächtig klein: {out}", cfg.log_level)
+
                 stats["written"] += 1
             except Exception as e:
                 log("ERROR", f"Domain {dom} fehlgeschlagen: {e}"); stats["failed"] += 1
