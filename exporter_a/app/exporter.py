@@ -148,7 +148,7 @@ def fetch_ha_history(entity_ids: List[str], day: dt.date, tz: ZoneInfo, cfg_leve
                     if eid_raw:
                         eid_normalized = eid_raw.strip().lower()
                         
-                        if matched_count == 0 and unmatched_count == 0:
+                        if matched_count == 0:
                             log("DEBUG", f"First event: eid_raw='{eid_raw}', normalized='{eid_normalized}'", cfg_level)
                             log("DEBUG", f"In normalized_map? {eid_normalized in normalized_map}", cfg_level)
                         
