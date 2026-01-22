@@ -1,8 +1,8 @@
 {
   "name": "ROALS Exporter A",
-  "version": "0.5.0-lks",
+  "version": "0.5.1",
   "slug": "roals_exporter_a",
-  "description": "Truth Layer Exporter (LKS) - Platinum Batch Edition",
+  "description": "Truth Layer Exporter - Registry-First Edition mit LKS Sampling",
   "arch": ["amd64", "aarch64", "armv7", "armhf"],
   "startup": "once",
   "boot": "manual",
@@ -10,15 +10,23 @@
   "homeassistant_api": true,
   "map": ["share:rw"],
   "options": {
-    "run_mode": "daily_all_domains",
+    "run_mode": "skeleton",
     "log_level": "INFO",
+    "data_root": "/share/nara_data",
+    "timezone": "Asia/Manila",
     "target_date": "",
-    "exporter_domain": ""
+    "exporter_domain": "",
+    "entities": [],
+    "registry_path": "/share/nara_data/registry/entity_registry.json"
   },
   "schema": {
-    "run_mode": "list(daily_all_domains|daily_one_domain|skeleton)",
+    "run_mode": "list(skeleton|oneshot_domain|oneshot_all_domains|daily_all_domains)",
     "log_level": "list(DEBUG|INFO|WARNING|ERROR)",
+    "data_root": "str",
+    "timezone": "str",
     "target_date": "str?",
-    "exporter_domain": "list(budget|cameras|climate_eg|climate_og|energy|events|internet|motion|network|prices|security|system|weather)?"
+    "exporter_domain": "list(budget|cameras|climate_eg|climate_og|energy|events|internet|motion|network|prices|security|system|weather)?",
+    "entities": ["str?"],
+    "registry_path": "str"
   }
 }
