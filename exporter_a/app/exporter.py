@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-ROALS Exporter A (Truth Layer) — Platinum Production Release
-Version: 2026.1.13-lks
-Changelog: Specific Exceptions, Performance Metrics, Heartbeat Diagnostics, Post-Write Sanity.
+ROALS Exporter A (Truth Layer) — Platinum Batch Edition
+Version: 2026.1.14-lks
+Changelog: Reduced UI, Hardcoded Infrastructure, Enum-Routing, Enhanced Safety.
 """
 
 from __future__ import annotations
@@ -29,15 +29,19 @@ except ImportError:
         print("CRITICAL: zoneinfo module missing. Python 3.9+ required.")
         sys.exit(2)
 
-# --- Constants ---
-EXPORTER_VERSION = "2026.1.13-lks"
+# --- ROALS Manila Infrastructure Constants ---
+# Diese Pfade sind nun fest im System verankert (Single Source of Truth)
+DATA_ROOT = "/share/nara_data"
+REGISTRY_PATH = "/share/nara_data/registry/entity_registry.json"
+DEFAULT_TIMEZONE = "Asia/Manila"
+
+# --- Logic Constants ---
+EXPORTER_VERSION = "2026.1.14-lks"
 RASTER_MINUTES = 5
 SLOTS_PER_DAY = 288
 API_TIMEOUT = 120
 HISTORY_LOOKBACK_MIN = 15
 ALLOWED_DOMAINS = ["budget", "cameras", "climate_eg", "climate_og", "energy", "events", "internet", "motion", "network", "prices", "security", "system", "weather"]
-VALID_RUN_MODES = {"skeleton", "oneshot_today", "oneshot_date", "daily_all_domains"}
-VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR"}
 
 def log(level: str, msg: str, cfg_level: str = "INFO") -> None:
     _LEVELS = {"DEBUG": 10, "INFO": 20, "WARNING": 30, "ERROR": 40}
@@ -47,58 +51,43 @@ def log(level: str, msg: str, cfg_level: str = "INFO") -> None:
 
 @dataclass(frozen=True)
 class Settings:
-    data_root: str
-    timezone: str
     log_level: str
     run_mode: str
     target_date: Optional[str]
     exporter_domain: Optional[str]
-    entities: List[str]
-    registry_path: str
 
     @staticmethod
     def from_options(opts: Dict[str, Any]) -> "Settings":
+        mode = str(opts.get("run_mode", "daily_all_domains")).strip()
         log_lvl = str(opts.get("log_level", "INFO")).strip().upper()
-        if log_lvl not in VALID_LOG_LEVELS: log_lvl = "INFO"
         
-        # Timezone Validierung (Spezifisch)
-        tz_str = str(opts.get("timezone", "Asia/Manila")).strip()
-        try: ZoneInfo(tz_str)
-        except Exception as e: raise ValueError(f"Ungültige Timezone '{tz_str}': {e}")
-
-        mode = str(opts.get("run_mode", "skeleton")).strip()
-        if mode not in VALID_RUN_MODES: raise ValueError(f"Ungültiger run_mode: {mode}")
-
         target_date = opts.get("target_date")
-        if mode == "oneshot_date":
-            if not target_date: raise ValueError("oneshot_date benötigt target_date.")
+        if target_date:
             try: dt.date.fromisoformat(target_date)
-            except ValueError: raise ValueError(f"Ungültiges target_date Format '{target_date}'. Erwarte YYYY-MM-DD.")
+            except ValueError: raise ValueError(f"Ungültiges Datum: {target_date}. Erwarte YYYY-MM-DD.")
+        
+        exp_dom = opts.get("exporter_domain")
+        if mode == "daily_one_domain" and not exp_dom:
+            raise ValueError("Modus 'daily_one_domain' erfordert eine 'exporter_domain'.")
 
         return Settings(
-            data_root=str(opts.get("data_root", "/share/nara_data")).strip(),
-            timezone=tz_str,
             log_level=log_lvl,
             run_mode=mode,
             target_date=target_date,
-            exporter_domain=opts.get("exporter_domain"),
-            entities=opts.get("entities", []),
-            registry_path=str(opts.get("registry_path", "/share/nara_data/registry/entity_registry.json")).strip(),
+            exporter_domain=exp_dom
         )
 
-# --- Robust Helpers ---
-def load_registry(path: str, cfg_level: str) -> Dict[str, Any]:
-    if not os.path.exists(path): return {}
+# --- Helper Functions ---
+def load_registry(cfg_level: str) -> Dict[str, Any]:
+    if not os.path.exists(REGISTRY_PATH):
+        log("ERROR", f"Registry nicht gefunden unter {REGISTRY_PATH}", cfg_level)
+        return {}
     try:
-        with open(path, "r", encoding="utf-8") as f: data = json.load(f)
+        with open(REGISTRY_PATH, "r", encoding="utf-8") as f: data = json.load(f)
         ENTITY_PREFIXES = ("sensor.", "binary_sensor.", "climate.", "switch.", "light.", "input_")
         return {k: v for k, v in data.items() if isinstance(v, dict) and k.startswith(ENTITY_PREFIXES)}
-    except json.JSONDecodeError as e:
-        log("ERROR", f"Registry JSON korrupt: {e}", cfg_level); return {}
-    except OSError as e:
-        log("ERROR", f"Registry Lesefehler: {e}", cfg_level); return {}
     except Exception as e:
-        log("ERROR", f"Registry Unerwarteter Fehler: {e}", cfg_level); return {}
+        log("ERROR", f"Registry Fehler: {e}", cfg_level); return {}
 
 def entity_is_active(meta: Dict[str, Any], target: dt.date) -> bool:
     try:
@@ -107,32 +96,25 @@ def entity_is_active(meta: Dict[str, Any], target: dt.date) -> bool:
         return target >= since
     except (ValueError, TypeError): return False
 
-def check_disk_space(path: str, min_mb: int = 100) -> bool:
-    try:
-        if not os.path.exists(path): return True
-        return (shutil.disk_usage(path).free / (1024*1024)) >= min_mb
-    except OSError: return True
-
-def update_heartbeat(tz: ZoneInfo, cfg_level: str) -> None:
+def update_heartbeat(cfg_level: str) -> None:
     token = os.environ.get("SUPERVISOR_TOKEN")
     if not token: return
     try:
+        tz = ZoneInfo(DEFAULT_TIMEZONE)
         url = "http://supervisor/core/api/services/input_datetime/set_datetime"
         data = json.dumps({"entity_id": "input_datetime.nara_last_success", "datetime": dt.datetime.now(tz=tz).isoformat()}).encode()
         req = urllib.request.Request(url, data=data, headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
-        resp = urllib.request.urlopen(req, timeout=10)
-        if resp.status != 200: log("WARNING", f"Heartbeat Status {resp.status}", cfg_level)
-    except urllib.error.HTTPError as e:
-        if e.code == 404: log("WARNING", "Heartbeat-Entity 'input_datetime.nara_last_success' fehlt in HA.", cfg_level)
-        else: log("WARNING", f"Heartbeat HTTP Error: {e}", cfg_level)
+        urllib.request.urlopen(req, timeout=10)
+        log("DEBUG", "Heartbeat gesendet.", cfg_level)
     except Exception as e: log("WARNING", f"Heartbeat Fehler: {e}", cfg_level)
 
 # --- Core Logic ---
-def fetch_ha_history(entity_ids: List[str], day: dt.date, tz: ZoneInfo, cfg_level: str) -> Dict[str, List[Dict]]:
+def fetch_ha_history(entity_ids: List[str], day: dt.date, cfg_level: str) -> Dict[str, List[Dict]]:
     token = os.environ.get("SUPERVISOR_TOKEN")
     if not token or not entity_ids: return {eid: [] for eid in entity_ids}
-
-    t0 = dt.datetime.now() # Performance Start
+    
+    t0 = dt.datetime.now()
+    tz = ZoneInfo(DEFAULT_TIMEZONE)
     start_dt = dt.datetime.combine(day, dt.time(0, 0), tzinfo=tz) - dt.timedelta(minutes=HISTORY_LOOKBACK_MIN)
     start_iso = start_dt.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
     
@@ -142,10 +124,8 @@ def fetch_ha_history(entity_ids: List[str], day: dt.date, tz: ZoneInfo, cfg_leve
     try:
         with urllib.request.urlopen(req, timeout=API_TIMEOUT) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-            
-            # Performance Check
             dur = (dt.datetime.now() - t0).total_seconds()
-            if dur > 30: log("WARNING", f"Langsame API Antwort: {dur:.1f}s für {len(entity_ids)} Sensoren.", cfg_level)
+            if dur > 30: log("WARNING", f"Langsame API Antwort: {dur:.1f}s", cfg_level)
             
             h_map = {eid: [] for eid in entity_ids}
             for entity_list in data:
@@ -174,7 +154,7 @@ def map_history_to_slots(ts_iso: List[str], history: List[Dict], locf_max_min: i
                 state_clean = str(state).strip()
                 if state_clean:
                     try: last_val = float(state_clean)
-                    except ValueError: last_val = state_clean # Nur ValueError fangen
+                    except ValueError: last_val = state_clean
                     last_val_time = events[e_idx][0]
             e_idx += 1
         
@@ -184,26 +164,24 @@ def map_history_to_slots(ts_iso: List[str], history: List[Dict], locf_max_min: i
             values.append(last_val)
     return values
 
-def build_daily_payload(domain: str, day: dt.date, tz: ZoneInfo, entities_meta: Dict[str, Any], cfg_level: str) -> Dict[str, Any]:
+def build_daily_payload(domain: str, day: dt.date, entities_meta: Dict[str, Any], cfg_level: str) -> Dict[str, Any]:
+    tz = ZoneInfo(DEFAULT_TIMEZONE)
     start_dt = dt.datetime(day.year, day.month, day.day, 0, 0, 0, tzinfo=tz)
     ts_iso = [(start_dt + dt.timedelta(minutes=RASTER_MINUTES * i)).isoformat() for i in range(SLOTS_PER_DAY)]
     
     sorted_eids = sorted(entities_meta.keys())
-    history_map = fetch_ha_history(sorted_eids, day, tz, cfg_level)
+    history_map = fetch_ha_history(sorted_eids, day, cfg_level)
     
     timeseries, source_map = {"ts_iso": ts_iso}, {}
     for eid in sorted_eids:
         metric = entities_meta[eid].get("metric", {})
-        suffix = metric.get("column_unit_suffix")
-        if suffix is None: 
-            log("WARNING", f"{eid}: suffix fehlt, nutze ''", cfg_level); suffix = ""
-            
+        suffix = metric.get("column_unit_suffix") or ""
         locf_max = metric.get("agg_policy", {}).get("locf_max_duration_min", 15)
         if not isinstance(locf_max, (int, float)) or locf_max <= 0: locf_max = 15
 
         col_key = f"{re.sub(r'[^a-z0-9]+', '_', eid.lower()).strip('_')}{suffix}"
         if col_key in source_map:
-            raise ValueError(f"CRITICAL: Key Collision für {col_key} ({eid} vs {source_map[col_key]['ha_entity_id']})")
+            raise ValueError(f"Collision: {col_key} ({eid} vs {source_map[col_key]['ha_entity_id']})")
             
         source_map[col_key] = {"ha_entity_id": eid}
         timeseries[col_key] = map_history_to_slots(ts_iso, history_map.get(eid, []), locf_max)
@@ -216,38 +194,43 @@ def build_daily_payload(domain: str, day: dt.date, tz: ZoneInfo, entities_meta: 
 def main() -> int:
     stats = {"written": 0, "skipped_exists": 0, "skipped_empty": 0, "failed": 0}
     exit_code = 0
-    
     try:
         with open("/data/options.json", "r") as f: opts = json.load(f)
-        c = Settings.from_options(opts)
+        cfg = Settings.from_options(opts)
         
-        if not check_disk_space(c.data_root):
-            log("ERROR", f"Disk voll: {c.data_root}"); return 2
+        # Disk Check
+        if shutil.disk_usage(DATA_ROOT).free / (1024*1024) < 100:
+            log("ERROR", "Disk voll."); return 2
 
-        tz = ZoneInfo(c.timezone)
-        day = dt.date.fromisoformat(c.target_date) if c.target_date else dt.datetime.now(tz=tz).date()
-        reg = load_registry(c.registry_path, c.log_level)
+        tz = ZoneInfo(DEFAULT_TIMEZONE)
+        day = dt.date.fromisoformat(cfg.target_date) if cfg.target_date else dt.datetime.now(tz=tz).date()
+        reg = load_registry(cfg.log_level)
         
-        if c.run_mode == "skeleton": return 0
-        domains = sorted(ALLOWED_DOMAINS) if c.run_mode == "daily_all_domains" else [c.exporter_domain]
+        if cfg.run_mode == "skeleton": return 0
+        
+        # Domain Filterung
+        if cfg.run_mode == "daily_all_domains":
+            domains = sorted(ALLOWED_DOMAINS)
+        else: # daily_one_domain
+            domains = [cfg.exporter_domain]
 
-        log("INFO", f"Exporter {EXPORTER_VERSION} Start: Mode={c.run_mode}, Day={day}", c.log_level)
+        log("INFO", f"ROALS A {EXPORTER_VERSION} | Mode: {cfg.run_mode} | Day: {day}", cfg.log_level)
 
         for dom in domains:
             if not dom: continue
             try:
-                if c.run_mode == "daily_all_domains":
-                    active = {eid: m for eid, m in reg.items() if m.get("exporter_domain") == dom and entity_is_active(m, day)}
-                else:
-                    active = {eid: reg.get(eid, {"metric": {}}) for eid in c.entities}
+                # Routing via Registry
+                active = {eid: m for eid, m in reg.items() if m.get("exporter_domain") == dom and entity_is_active(m, day)}
+                
+                if not active:
+                    stats["skipped_empty"] += 1; continue
 
-                if not active: stats["skipped_empty"] += 1; continue
+                out = os.path.join(DATA_ROOT, f"{day.year:04d}", f"{day.month:02d}", f"{day.isoformat()}_{dom}.json")
+                if os.path.exists(out):
+                    stats["skipped_exists"] += 1; continue
 
-                out = os.path.join(c.data_root, f"{day.year:04d}", f"{day.month:02d}", f"{day.isoformat()}_{dom}.json")
-                if os.path.exists(out): stats["skipped_exists"] += 1; continue
-
-                log("INFO", f"Verarbeite {dom} ({len(active)} Entities)...", c.log_level)
-                payload = build_daily_payload(dom, day, tz, active, c.log_level)
+                log("INFO", f"Exportiere {dom}...", cfg.log_level)
+                payload = build_daily_payload(dom, day, active, cfg.log_level)
                 
                 os.makedirs(os.path.dirname(out), exist_ok=True)
                 tmp = out + ".tmp"
@@ -255,24 +238,17 @@ def main() -> int:
                     json.dump(payload, f, separators=(",", ":"), sort_keys=True)
                     f.flush(); os.fsync(f.fileno())
                 os.replace(tmp, out)
-                
-                # Sanity Check
-                if os.path.getsize(out) < 1024:
-                    log("WARNING", f"Datei verdächtig klein: {out}", c.log_level)
-
                 stats["written"] += 1
-            except Exception as e: 
-                log("ERROR", f"Fehler in {dom}: {e}"); stats["failed"] += 1
+            except Exception as e:
+                log("ERROR", f"Domain {dom} fehlgeschlagen: {e}"); stats["failed"] += 1
 
-        if stats["written"] > 0: update_heartbeat(tz, c.log_level)
+        if stats["written"] > 0: update_heartbeat(cfg.log_level)
         exit_code = 1 if stats["failed"] > 0 else 0
 
     except Exception as e:
-        log("ERROR", f"Globaler Absturz: {e}")
-        exit_code = 2
+        log("ERROR", f"Globaler Fehler: {e}"); exit_code = 2
     finally:
         log("INFO", f"Run Summary: {stats}")
-    
     return exit_code
 
 if __name__ == "__main__": sys.exit(main())
