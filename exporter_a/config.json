@@ -1,6 +1,6 @@
 {
   "name": "ROALS Exporter A",
-  "version": "0.4.4-lks",
+  "version": "0.4.5-lks",
   "slug": "roals_exporter_a",
   "description": "Truth Layer Exporter (LKS Sampling)",
   "arch": ["amd64", "aarch64", "armv7", "armhf"],
