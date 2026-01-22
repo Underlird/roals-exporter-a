@@ -1,5 +1,5 @@
-!/usr/bin/env python3"""
-
+#!/usr/bin/env python3
+"""
 ROALS Exporter A (Truth Layer) — Registry-First Production Release
 Version: 2026.1.17-lks
 
