@@ -1,41 +1,5 @@
-{
-  "name": "ROALS Exporter A",
-  "version": "0.4.0",
-  "slug": "roals_exporter_a",
-  "description": "Truth Layer Exporter - Registry-First mit Batch-Mode Support",
-  "arch": ["amd64", "aarch64", "armv7", "armhf"],
-  "startup": "once",
-  "boot": "manual",
-  "hassio_api": true,
-  "homeassistant_api": true,
-  "map": ["share:rw"],
-  "options": {
-    "run_mode": "skeleton",
-    "log_level": "INFO",
-    "data_root": "/share/nara_data",
-    "timezone": "Asia/Manila",
-    "target_date": "",
-    "start_date": "",
-    "end_date": "",
-    "exporter_domain": "climate_og",
-    "entities": [],
-    "registry_path": "/share/nara_data/registry/entity_registry.json"
-  },
-  "schema": {
-    "run_mode": "list(skeleton|oneshot_domain|oneshot_all_domains|daily_all_domains)",
-    "log_level": "list(DEBUG|INFO|WARNING|ERROR)",
-    "data_root": "str",
-    "timezone": "str",
-    "target_date": "str?",
-    "start_date": "str?",
-    "end_date": "str?",
-    "exporter_domain": "list(climate_og|budget|cameras|climate_eg|energy|events|internet|motion|network|prices|security|system|weather)",
-    "entities": ["str?"],
-    "registry_path": "str"
-  }
-}
-#!/usr/bin/env python3
-"""
+!/usr/bin/env python3"""
+
 ROALS Exporter A (Truth Layer) — Registry-First Production Release
 Version: 2026.1.17-lks
 
