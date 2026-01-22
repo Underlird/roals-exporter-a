@@ -264,4 +264,65 @@ def build_daily_payload(domain: str, day: dt.date, tz: ZoneInfo, entities: List[
 
 def main() -> int:
     try:
-        with open("/
+        with open("/data/options.json", "r") as f:
+            cfg = Settings.from_options(json.load(f))
+        
+        tz = ZoneInfo(cfg.timezone)
+        day = dt.date.fromisoformat(cfg.target_date) if cfg.target_date else dt.datetime.now(tz=tz).date()
+        
+        log("INFO", f"Exporter {EXPORTER_VERSION} startet: Mode={cfg.run_mode}, Day={day}, TZ={cfg.timezone}", cfg.log_level)
+        
+        if cfg.run_mode == "skeleton":
+            log("INFO", "Skeleton Mode beendet.", cfg.log_level)
+            return 0
+        
+        if "oneshot" in cfg.run_mode and not cfg.entities:
+            log("ERROR", "Keine Entities konfiguriert fuer oneshot Mode.", cfg.log_level)
+            return 1
+            
+        domains = [cfg.exporter_domain] if "oneshot" in cfg.run_mode else ALLOWED_DOMAINS
+        entities_to_use = cfg.entities
+        
+        for dom in domains:
+            if not dom:
+                continue
+                
+            out_path = os.path.join(cfg.data_root, str(day.year), f"{day.month:02d}", f"{day.isoformat()}_{dom}.json")
+            
+            if os.path.exists(out_path):
+                log("WARNING", f"Datei existiert bereits: {out_path}", cfg.log_level)
+                continue
+                
+            os.makedirs(os.path.dirname(out_path), exist_ok=True)
+            
+            log("INFO", f"Generiere Payload fuer {dom} ({len(entities_to_use)} Entities)...", cfg.log_level)
+            payload = build_daily_payload(dom, day, tz, entities_to_use, cfg.log_level)
+            
+            tmp_path = out_path + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, separators=(",", ":"), sort_keys=True)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, out_path)
+            
+            try:
+                dir_fd = os.open(os.path.dirname(out_path), os.O_RDONLY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            except OSError:
+                pass
+
+            log("INFO", f"SUCCESS: {out_path} ({len(entities_to_use)} Entities)", cfg.log_level)
+
+        return 0
+        
+    except Exception as e:
+        log("ERROR", f"CRASH: {e}", "INFO")
+        import traceback
+        traceback.print_exc()
+        return 1
+
+if __name__ == "__main__":
+    sys.exit(main())
