@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-ROALS Exporter A (Truth Layer) — Final Production Core
-Version: 2026.1.9-lks (Robust Data Mapping)
+ROALS Exporter A (Truth Layer) — Restoration Core
+Version: 2026.1.10-lks
+Fokus: Reaktivierung der funktionierenden UTC-Mapping-Logik.
 """
 
 from __future__ import annotations
@@ -16,23 +17,17 @@ import urllib.request
 import urllib.parse
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
-
-try:
-    from zoneinfo import ZoneInfo
-except Exception:
-    ZoneInfo = None  # type: ignore
+from zoneinfo import ZoneInfo
 
 # --- Constants ---
-EXPORTER_VERSION = "2026.1.9-lks"
+EXPORTER_VERSION = "2026.1.10-lks"
 RASTER_MINUTES = 5
 SLOTS_PER_DAY = 288
 ALLOWED_DOMAINS = ["budget", "cameras", "climate_eg", "climate_og", "energy", "events", "internet", "motion", "network", "prices", "security", "system", "weather"]
 
 def log(level: str, msg: str, cfg_level: str = "INFO") -> None:
     _LEVELS = {"DEBUG": 10, "INFO": 20, "WARNING": 30, "ERROR": 40}
-    lvl = _LEVELS.get(level.upper(), 20)
-    cfg = _LEVELS.get(cfg_level.upper(), 20)
-    if lvl >= cfg:
+    if _LEVELS.get(level.upper(), 20) >= _LEVELS.get(cfg_level.upper(), 20):
         now = dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc).isoformat()
         print(f"{now} [{level.upper()}] {msg}", flush=True)
 
@@ -60,70 +55,51 @@ class Settings:
             registry_path=str(opts.get("registry_path", "/share/nara_data/registry/entity_registry.json")).strip(),
         )
 
-# --- Registry & Activity ---
-def load_registry(path: str, cfg_level: str) -> Dict[str, Any]:
-    if not os.path.exists(path):
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f: json.dump({}, f, indent=2)
-        return {}
-    with open(path, "r", encoding="utf-8") as f:
-        try: return json.load(f)
-        except: return {}
+def load_registry(path: str) -> Dict[str, Any]:
+    if not os.path.exists(path): return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f: return json.load(f)
+    except: return {}
 
 def entity_is_active(meta: Dict[str, Any], target: dt.date) -> bool:
     try:
         since = dt.date.fromisoformat(str(meta.get("since"))) if meta.get("since") else dt.date(1970, 1, 1)
-        if meta.get("until"):
-            return since <= target < dt.date.fromisoformat(str(meta.get("until")))
+        if meta.get("until"): return since <= target < dt.date.fromisoformat(str(meta.get("until")))
         return target >= since
     except: return False
 
-# --- API & Mapping ---
+# --- Die funktionierende History-Logik ---
 def fetch_ha_history(entity_ids: List[str], day: dt.date, tz: ZoneInfo, cfg_level: str) -> Dict[str, List[Dict]]:
     token = os.environ.get("SUPERVISOR_TOKEN")
     if not token or not entity_ids: return {eid: [] for eid in entity_ids}
 
-    # Zeitfenster: Start - 5 Min bis Ende des Tages
+    # Exakt der Zeit-Anker, der vorhin funktioniert hat
     start_dt = dt.datetime.combine(day, dt.time(0, 0), tzinfo=tz) - dt.timedelta(minutes=5)
-    end_dt = dt.datetime.combine(day, dt.time(23, 59, 59), tzinfo=tz)
-    
     start_iso = start_dt.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
-    end_iso = end_dt.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
     
-    params = {
-        "filter_entity_id": ",".join(entity_ids),
-        "end_time": end_iso,
-        "minimal_response": "0",
-        "no_attributes": "1",
-        "significant_changes_only": "0"
-    }
-    
-    url = f"http://supervisor/core/api/history/period/{urllib.parse.quote(start_iso)}?{urllib.parse.urlencode(params)}"
-    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+    url = f"http://supervisor/core/api/history/period/{urllib.parse.quote(start_iso)}?filter_entity_id={urllib.parse.quote(','.join(entity_ids))}&minimal_response=0"
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
     
     try:
         with urllib.request.urlopen(req, timeout=60) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-            h_map = {eid.lower(): [] for eid in entity_ids}
-            # HA API Mapping (Case-Insensitive)
+            h_map = {eid: [] for eid in entity_ids}
             for entity_list in data:
                 if entity_list:
-                    eid_api = entity_list[0].get("entity_id", "").lower()
-                    if eid_api in h_map:
-                        h_map[eid_api] = entity_list
-                        log("DEBUG", f"Fetched {len(entity_list)} events for {eid_api}", cfg_level)
-            
-            # Rückgabe-Map wieder auf Original-Keys mappen
-            return {eid: h_map.get(eid.lower(), []) for eid in entity_ids}
+                    eid = entity_list[0].get("entity_id")
+                    if eid in h_map: h_map[eid] = entity_list
+            return h_map
     except Exception as e:
         log("ERROR", f"API Fehler: {e}", cfg_level)
         return {eid: [] for eid in entity_ids}
 
+# --- Das funktionierende UTC-Stripping-Mapping ---
 def map_history_to_slots(ts_iso: List[str], history: List[Dict]) -> List[Any]:
     events = []
     for h in history:
-        t_str = h.get("last_updated")
+        t_str = h.get("last_updated") or h.get("last_changed")
         if t_str:
+            # Strikte UTC-Normalisierung und Stripping (wie in der Erfolgsversion)
             dt_utc = dt.datetime.fromisoformat(t_str.replace("Z", "+00:00")).astimezone(dt.timezone.utc)
             events.append((dt_utc.replace(tzinfo=None), h.get("state")))
     
@@ -131,17 +107,18 @@ def map_history_to_slots(ts_iso: List[str], history: List[Dict]) -> List[Any]:
     values, last_val, e_idx = [], None, 0
     
     for slot_str in ts_iso:
+        # Slot nach UTC wandeln und Strippen fuer "Apfel-zu-Apfel" Vergleich
         slot_dt_utc = dt.datetime.fromisoformat(slot_str).astimezone(dt.timezone.utc).replace(tzinfo=None)
+        
         while e_idx < len(events) and events[e_idx][0] <= slot_dt_utc:
             state = events[e_idx][1]
             if state not in (None, "unknown", "unavailable", ""):
                 try: last_val = float(state)
-                except: last_val = state
+                except: last_val = state 
             e_idx += 1
         values.append(last_val)
     return values
 
-# --- Payload ---
 def build_daily_payload(domain: str, day: dt.date, tz: ZoneInfo, entities_meta: Dict[str, Any], cfg_level: str) -> Dict[str, Any]:
     start_dt = dt.datetime(day.year, day.month, day.day, 0, 0, 0, tzinfo=tz)
     ts_iso = [(start_dt + dt.timedelta(minutes=RASTER_MINUTES * i)).isoformat() for i in range(SLOTS_PER_DAY)]
@@ -164,16 +141,14 @@ def build_daily_payload(domain: str, day: dt.date, tz: ZoneInfo, entities_meta: 
 def main() -> int:
     stats = {"written": 0, "skipped_exists": 0, "skipped_empty": 0, "failed": 0}
     try:
-        with open("/data/options.json", "r") as f: cfg_opts = json.load(f)
-        c = Settings.from_options(cfg_opts)
+        with open("/data/options.json", "r") as f: opts = json.load(f)
+        c = Settings.from_options(opts)
         tz = ZoneInfo(c.timezone)
         day = dt.date.fromisoformat(c.target_date) if c.target_date else dt.datetime.now(tz=tz).date()
-        reg = load_registry(c.registry_path, c.log_level)
+        reg = load_registry(c.registry_path)
         
         if c.run_mode == "skeleton": return 0
         domains = sorted(ALLOWED_DOMAINS) if c.run_mode == "daily_all_domains" else [c.exporter_domain]
-
-        log("INFO", f"Exporter {EXPORTER_VERSION} startet: Mode={c.run_mode}, Day={day}, TZ={c.timezone}", c.log_level)
 
         for dom in domains:
             if not dom: continue
@@ -188,7 +163,7 @@ def main() -> int:
                 out = os.path.join(c.data_root, f"{day.year:04d}", f"{day.month:02d}", f"{day.isoformat()}_{dom}.json")
                 if os.path.exists(out): stats["skipped_exists"] += 1; continue
 
-                log("INFO", f"Verarbeite {dom} ({len(active)} Entities)...", c.log_level)
+                log("INFO", f"Verarbeite {dom}...", c.log_level)
                 payload = build_daily_payload(dom, day, tz, active, c.log_level)
                 
                 os.makedirs(os.path.dirname(out), exist_ok=True)
@@ -198,10 +173,10 @@ def main() -> int:
                     f.flush(); os.fsync(f.fileno())
                 os.replace(tmp, out)
                 stats["written"] += 1
-            except Exception as e: log("ERROR", f"Fehler in Domain {dom}: {e}"); stats["failed"] += 1
+            except Exception as e: log("ERROR", f"Domain {dom}: {e}"); stats["failed"] += 1
 
         log("INFO", f"Run Summary: {stats}")
         return 1 if stats["failed"] > 0 else 0
-    except Exception as e: log("ERROR", f"Globaler Fehler: {e}"); return 2
+    except Exception as e: log("ERROR", f"Global: {e}"); return 2
 
 if __name__ == "__main__": sys.exit(main())
