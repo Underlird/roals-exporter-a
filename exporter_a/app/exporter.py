@@ -131,34 +131,43 @@ def fetch_ha_history(entity_ids: List[str], day: dt.date, tz: ZoneInfo, cfg_leve
 
 def map_history_to_slots(ts_iso: List[str], history: List[Dict]) -> List[Any]:
     """
-    KORREKTUR: Verbessertes LKS-Sampling (Last Known State).
+    ROALS-Mapping: UTC-normiertes LKS-Sampling.
+    Zwingt alle Zeitstempel auf naive UTC-Vergleiche, um Offset-Fehler zu vermeiden.
     """
     events = []
     for h in history:
-        t_str = h.get("last_updated")
+        t_str = h.get("last_updated") or h.get("last_changed")
         if t_str:
-            # HA Zeitstempel sind UTC
-            ts_dt = dt.datetime.fromisoformat(t_str.replace("Z", "+00:00"))
-            events.append((ts_dt, h.get("state")))
-    
+            # 1. HA-Zeitstempel parsen und strikt nach UTC konvertieren
+            # Wir entfernen 'Z' und ersetzen es durch +00:00 fuer volle ISO-Kompatibilitaet
+            dt_utc = dt.datetime.fromisoformat(t_str.replace("Z", "+00:00")).astimezone(dt.timezone.utc)
+            # 2. Zeitzone abstreifen (naive datetime) fuer fehlerfreien Vergleich
+            events.append((dt_utc.replace(tzinfo=None), h.get("state")))
+            
+    # Chronologisch sortieren (Wichtig fuer die Schleife unten)
     events.sort(key=lambda x: x[0])
     
     values = []
-    last_val = None
     e_idx = 0
+    last_val = None
     
     for slot_str in ts_iso:
-        slot_dt = dt.datetime.fromisoformat(slot_str)
-        # Suche den letzten gültigen Wert VOR oder GLEICH dem Slot-Zeitpunkt
-        while e_idx < len(events) and events[e_idx][0] <= slot_dt:
+        # 3. Slot-Zeitstempel (Asia/Manila) parsen, nach UTC wandeln und abstreifen
+        # Jetzt vergleichen wir "Apfel mit Apfel" auf der UTC-Achse
+        slot_dt_utc = dt.datetime.fromisoformat(slot_str).astimezone(dt.timezone.utc).replace(tzinfo=None)
+        
+        # 4. Alle Events finden, die VOR oder GENAU zum Slot-Zeitpunkt passierten
+        while e_idx < len(events) and events[e_idx][0] <= slot_dt_utc:
             state = events[e_idx][1]
             if state not in (None, "unknown", "unavailable", ""):
                 try:
                     last_val = float(state)
                 except ValueError:
-                    last_val = state
+                    last_val = state 
             e_idx += 1
+            
         values.append(last_val)
+        
     return values
 
 # ----------------------------
