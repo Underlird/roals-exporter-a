@@ -77,40 +77,53 @@ class Settings:
 # ----------------------------
 # Data Sampling (Truth Extraction)
 # ----------------------------
-
-def fetch_ha_history(entity_ids: List[str], day: dt.date, tz: ZoneInfo, cfg_level: str) -> Dict[str, List[Dict]]:
+deffetch _h_ha_history(entity_ids: List[str], day: dt.date, tz: ZoneInfo, cfg_level: str) -> Dict[str, List[Dict]]:
     token = os.environ.get("SUPERVISOR_TOKEN")
     if not token:
         log("ERROR", "SUPERVISOR_TOKEN fehlt! API-Zugriff unmöglich.", cfg_level)
         return {}
 
-    # Zeitfenster basierend auf lokaler TZ (Berlin im Test, Manila in Prod)
     start_dt = dt.datetime.combine(day, dt.time(0, 0), tzinfo=tz) - dt.timedelta(minutes=5)
     end_dt = dt.datetime.combine(day, dt.time(23, 59, 59), tzinfo=tz)
     
     start_iso = start_dt.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
     end_iso = end_dt.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
     
+    # KRITISCHE ÄNDERUNG: Strings statt Booleans
     params = {
         "filter_entity_id": ",".join(entity_ids),
         "end_time": end_iso,
-        "minimal_response": "false",
-        "no_attributes": "1"
+        "minimal_response": "0",              # String "0" statt Boolean False
+        "no_attributes": "1",                 # String "1" statt Boolean True
+        "significant_changes_only": "0"       # String "0" - dieser fehlte komplett
     }
     
     url = f"http://supervisor/core/api/history/period/{urllib.parse.quote(start_iso)}?{urllib.parse.urlencode(params)}"
     req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
     
+    log("DEBUG", f"History API Request URL (ohne Token)", cfg_level)
+    
     try:
         with urllib.request.urlopen(req, timeout=60) as resp:
             data = json.loads(resp.read().decode("utf-8"))
+            
+            # Debug: Gesamtanzahl
+            total_items = sum(len(entity_list) for entity_list in data if isinstance(entity_list, list))
+            log("DEBUG", f"History API Response: {total_items} total items", cfg_level)
+            
             history_map = {eid: [] for eid in entity_ids}
             for entity_list in data:
                 for event in entity_list:
                     eid = event.get("entity_id")
                     if eid in history_map:
                         history_map[eid].append(event)
+            
+            # Debug: Pro Entity
+            for eid, events in history_map.items():
+                log("DEBUG", f"Entity {eid}: {len(events)} Events geladen.", cfg_level)
+                
             return history_map
+            
     except Exception as e:
         log("ERROR", f"History API Fehler: {e}", cfg_level)
         return {}
