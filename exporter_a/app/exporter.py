@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
-exporter.py - ROALS Exporter A (Batch Edition)
-Version: 2026.02.01-ROALS-BATCH
+exporter.py - ROALS Exporter A (Daily Truth Engine)
+Version: 2026.02.02-ROALS-FINAL-PRO
 
 Features:
-- Modes: daily_truth (288-slot) | raw_snapshot (audit)
-- Scope: Single Day or Date Range (Batch)
-- Targets: Single Domain or All Domains
-- Core: Registry-First, Atomic Writes, Integrity Hashes
+- Primary: daily_truth (288-slot 5min timeseries)
+- Optional: raw_snapshot (FULL forensic event dump with attributes)
+- Registry-First: Enforces roals_id and domain strictness upfront
+- Data Types: Robust Numeric and Binary State (0/1) mapping
+- Durable: Atomic writes with defensive cleanup and unique filenames
+- Forensic: SHA-256 integrity hashing & rich metadata
 """
 
 import argparse
@@ -31,14 +33,14 @@ except ImportError:
     try:
         from backports.zoneinfo import ZoneInfo
     except ImportError:
-        print("CRITICAL: ZoneInfo not found.")
+        print("CRITICAL: ZoneInfo not found. Please use Python 3.9+ or install backports.zoneinfo")
         sys.exit(1)
 
 # ROALS Constants
 SLOTS_PER_DAY = 288
 RASTER_MINUTES = 5
 HISTORY_LOOKBACK_MIN = 30
-BINARY_TRUE_VALUES = {"on", "open", "true", "detected", "home", "active"}
+BINARY_TRUE_VALUES = {"on", "open", "true", "detected", "home", "active", "occupied"}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("ROALS-Exporter")
@@ -46,7 +48,7 @@ logger = logging.getLogger("ROALS-Exporter")
 def get_headers():
     token = os.getenv("SUPERVISOR_TOKEN") or os.getenv("HA_API_TOKEN")
     if not token:
-        logger.error("No token found.")
+        logger.error("No token found (SUPERVISOR_TOKEN or HA_API_TOKEN).")
         sys.exit(1)
     return {"Authorization": f"Bearer {token}", "content-type": "application/json"}
 
@@ -70,6 +72,7 @@ def write_atomic_json(path: Path, data: dict):
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_name = None
     try:
+        # P1.2 Defensive Tmp Cleanup
         fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent), text=True)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
@@ -87,43 +90,57 @@ def write_atomic_json(path: Path, data: dict):
         if tmp_name and os.path.exists(tmp_name): os.remove(tmp_name)
         raise e
 
+# P0.1: Policy Normalization
 def normalize_policy(policy: str) -> str:
     p = str(policy).lower().strip()
     if p in ("avg", "average"): return "mean"
     return p
 
 def map_events_to_slots(events: List[Dict], start_dt: datetime, raw_policy: str, is_binary: bool) -> List[Any]:
+    """
+    Maps HA history events to 288 slots.
+    P0.2: Handles Numeric (float) and Binary (0/1) with strictly enforced logic.
+    """
     slots = [None] * SLOTS_PER_DAY
     parsed_events = []
+    
     policy = normalize_policy(raw_policy)
 
+    # 1. Parse Events
     for e in events:
         state = e.get("state")
+        # P0.2: Unknown/Unavailable -> None (Skip here, slot becomes None if no valid data)
         if state in (None, "unknown", "unavailable", ""): continue
+        
         ts_str = e.get("last_changed")
         if not ts_str: continue
+        
         try:
             ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
             if is_binary:
+                # P0.2: Binary Slotting 0/1
                 val = 1 if str(state).lower() in BINARY_TRUE_VALUES else 0
             else:
                 val = float(state)
             parsed_events.append((ts, val))
-        except (ValueError, TypeError): continue
+        except (ValueError, TypeError):
+            continue
     
     parsed_events.sort(key=lambda x: x[0])
     
+    # 2. Linear Slotting (Optimized)
     event_idx = 0
     num_events = len(parsed_events)
     last_known = None
 
-    # Init LOCF
+    # LOCF Initialization
     while event_idx < num_events and parsed_events[event_idx][0] <= start_dt:
         last_known = parsed_events[event_idx][1]
         event_idx += 1
 
     for i in range(SLOTS_PER_DAY):
         slot_end = start_dt + timedelta(minutes=(i + 1) * RASTER_MINUTES)
+        
         vals_in_slot = []
         
         while event_idx < num_events and parsed_events[event_idx][0] <= slot_end:
@@ -135,16 +152,18 @@ def map_events_to_slots(events: List[Dict], start_dt: datetime, raw_policy: str,
         if not vals_in_slot:
             if last_known is not None:
                 slots[i] = last_known # LOCF
-            continue
+            continue # Leave as None if no history
         
+        # 3. Apply Policy
         if is_binary:
+            # P0.2: Binary always uses 'last'
             slots[i] = vals_in_slot[-1]
         else:
             if policy == "max": slots[i] = max(vals_in_slot)
             elif policy == "min": slots[i] = min(vals_in_slot)
             elif policy == "mean": slots[i] = round(sum(vals_in_slot) / len(vals_in_slot), 4)
             elif policy == "sum": slots[i] = sum(vals_in_slot)
-            else: slots[i] = vals_in_slot[-1]
+            else: slots[i] = vals_in_slot[-1] # Default: last
             
     return slots
 
@@ -159,9 +178,11 @@ def fetch_history(session, entity_ids, start_dt, end_dt, ha_url, mode):
         url = f"{ha_url}/api/history/period/{start_iso}"
         params = {"filter_entity_id": ",".join(chunk), "end_time": end_iso}
         
+        # P0.3: Raw Snapshot = Full Data (Attributes included). Daily Truth = Minimal.
         if mode == "daily_truth":
             params["minimal_response"] = "1"
             params["no_attributes"] = "1"
+        # else: raw_snapshot gets full response for forensics
         
         for attempt in [1, 2, 3]:
             try:
@@ -176,6 +197,7 @@ def fetch_history(session, entity_ids, start_dt, end_dt, ha_url, mode):
             except Exception as e:
                 if attempt == 3: logger.error(f"Chunk fetch failed: {e}")
                 time.sleep(2)
+                
     return all_data
 
 def main():
@@ -255,10 +277,20 @@ def main():
     registry_hash = calculate_file_hash(reg_path)
     with open(reg_path) as f: raw_registry = json.load(f)
     
-    # Filter Valid
-    valid_registry = {k: v for k, v in raw_registry.items() if v.get("roals_id") and v.get("exporter_domain")}
+    # P0.4: Registry-First Upfront Filter
+    # Only entries with roals_id AND exporter_domain allow entry into the domain set
+    valid_registry = {}
+    skipped_count = 0
+    for eid, meta in raw_registry.items():
+        if meta.get("roals_id") and meta.get("exporter_domain"):
+            valid_registry[eid] = meta
+        else:
+            skipped_count += 1
     
-    # 3. Determine Domains
+    if skipped_count > 0:
+        logger.warning(f"Skipped {skipped_count} registry entries (missing roals_id/domain).")
+    
+    # 3. Determine Domains (from VALID entries only)
     available_domains = sorted(list(set(m["exporter_domain"] for m in valid_registry.values())))
     target_domains = []
     
@@ -269,7 +301,7 @@ def main():
         if args.domain in available_domains:
             target_domains = [args.domain]
         else:
-            logger.warning(f"Domain '{args.domain}' empty or not in registry.")
+            logger.warning(f"Domain '{args.domain}' empty or not in valid registry.")
     
     if not target_domains:
         logger.error("No valid domains selected.")
@@ -280,12 +312,10 @@ def main():
     session.headers.update(get_headers())
     
     system_id = os.getenv("ROALS_SYSTEM_ID", "porac_main")
-
     total_ops = len(target_dates) * len(target_domains)
     curr_op = 0
 
     for day in target_dates:
-        # Time Windows
         start_dt = datetime.combine(day, dtime.min).replace(tzinfo=tz)
         end_dt = start_dt + timedelta(days=1)
         fetch_start = start_dt - timedelta(minutes=HISTORY_LOOKBACK_MIN)
@@ -332,6 +362,7 @@ def main():
                         kind = metric.get("kind", "numeric")
                         profile = str(meta.get("profile", "")).lower()
                         
+                        # P0.2: Safe Binary Detection
                         is_binary = False
                         if (kind == "event_state" or 
                             "contact_state" in profile or 
@@ -351,12 +382,12 @@ def main():
 
                 payload["meta"]["integrity_hash"] = calculate_integrity_hash(payload)
                 
-                # Out
-                out_path = Path(args.out) / "daily" / dom / f"{day}.json"
+                # P0.5: Unique Filenames (YYYY-MM-DD_domain.json)
+                out_path = Path(args.out) / "daily" / dom / f"{day}_{dom}.json"
                 write_atomic_json(out_path, payload)
                 
             except Exception as e:
-                logger.error(f"Failed {dom} on {day}: {e}")
+                logger.error(f"Failed {dom} on {day}: {e}", exc_info=True)
 
 if __name__ == "__main__":
     main()
