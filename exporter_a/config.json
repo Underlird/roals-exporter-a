@@ -1,6 +1,6 @@
 {
   "name": "ROALS Exporter A",
-  "version": "0.7.1",
+  "version": "0.7.2",
   "slug": "roals_exporter_a",
   "description": "ROALS Truth Layer - Daily Truth (288 Slots) mit Batch- & History-Support",
   "arch": ["amd64", "aarch64", "armv7", "armhf"],
