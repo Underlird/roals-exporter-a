@@ -5,11 +5,12 @@ ENV PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
+# System-Pakete: jq für Debugging, tzdata für ZoneInfo-Support
 RUN apt-get update && \
     apt-get install -y --no-install-recommends jq tzdata && \
     rm -rf /var/lib/apt/lists/*
 
-# WICHTIG: requests installieren, damit exporter.py funktioniert
+# Python-Dependencies: requests ist Pflicht für den neuen Exporter
 RUN pip install --no-cache-dir requests
 
 COPY app/ /app/
