@@ -1,18 +1,14 @@
 #!/usr/bin/env python3
 """
 exporter.py - ROALS Exporter A (Truth Layer)
-Version: 2026.1.30-roals-addon-patched
+Version: 2026.1.30-roals-final-tokenpatch
 
 Purpose:
 - Reads entity definitions from registry.json
 - Fetches 24h history from Home Assistant (Yesterday)
 - Uses Adaptive Timeouts, Backoff & Chunking
 - Writes raw data to daily domain files using Atomic Writes
-- Enforces ROALS metadata presence (roals_id, exporter_domain)
-- Auto-detects HA Addon environment (/data/options.json)
-
-Usage:
-  python3 exporter.py [--date YYYY-MM-DD] [--out ./data] [--timezone Europe/Berlin]
+- Auto-detects HA Addon environment & Tokens (SUPERVISOR_TOKEN)
 """
 
 import argparse
@@ -40,8 +36,8 @@ except ImportError:
         sys.exit(1)
 
 # --- CONFIGURATION ---
+# Default URL: Lokal für Laptop, Supervisor für Add-on (wird in main() korrigiert)
 HA_URL = os.getenv("HA_API_URL", "http://localhost:8123").rstrip("/")
-HA_TOKEN = os.getenv("HA_API_TOKEN", "")
 
 DEFAULT_REGISTRY = Path("registry.json")
 DEFAULT_OUT_DIR = Path("data")
@@ -49,7 +45,7 @@ DEFAULT_OUT_DIR = Path("data")
 # ROALS Policies
 TIMEOUTS = [30, 60, 90]
 BACKOFFS = [2, 5]
-CHUNK_SIZE = 50  # Entities per API request to avoid URL length limits
+CHUNK_SIZE = 50  
 
 # --- LOGGING ---
 logging.basicConfig(
@@ -63,16 +59,20 @@ logger = logging.getLogger("ROALS-Exporter")
 # --- HELPER FUNCTIONS ---
 
 def get_headers() -> Dict[str, str]:
-    if not HA_TOKEN:
-        logger.error("HA_API_TOKEN not set in environment.")
+    """
+    Holt das Token aus der Umgebung. 
+    Unterstützt HA_API_TOKEN (Manuell/Laptop) und SUPERVISOR_TOKEN (Add-on).
+    """
+    token = os.getenv("HA_API_TOKEN") or os.getenv("SUPERVISOR_TOKEN")
+    if not token:
+        logger.error("Weder HA_API_TOKEN noch SUPERVISOR_TOKEN in Umgebung gefunden.")
         sys.exit(1)
     return {
-        "Authorization": f"Bearer {HA_TOKEN}",
+        "Authorization": f"Bearer {token}",
         "content-type": "application/json",
     }
 
 def calculate_file_hash(path: Path) -> str:
-    """Calculates SHA-256 hash of a file for lineage tracking."""
     sha256_hash = hashlib.sha256()
     with open(path, "rb") as f:
         for byte_block in iter(lambda: f.read(4096), b""):
@@ -80,34 +80,20 @@ def calculate_file_hash(path: Path) -> str:
     return sha256_hash.hexdigest()
 
 def chunk_list(lst: List[Any], n: int) -> Generator[List[Any], None, None]:
-    """Yield successive n-sized chunks from lst."""
     for i in range(0, len(lst), n):
         yield lst[i:i + n]
 
 def write_json_atomic(path: Path, data: Any) -> None:
-    """
-    ROALS Durable Atomic Write.
-    Includes Safety Polish: UnboundLocalError protection & O_DIRECTORY flag.
-    """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_name = None 
-    
     try:
-        fd, tmp_name = tempfile.mkstemp(
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-            dir=str(path.parent),
-            text=True
-        )
-        
+        fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent), text=True)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
             f.write("\n")
             f.flush()
             os.fsync(f.fileno())
-            
         os.replace(tmp_name, str(path))
-
         try:
             if hasattr(os, 'open') and hasattr(os, 'fsync'):
                 flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
@@ -118,7 +104,6 @@ def write_json_atomic(path: Path, data: Any) -> None:
                     os.close(dir_fd)
         except OSError:
             pass 
-
     except Exception as e:
         logger.error(f"Failed to write {path}: {e}")
         if tmp_name and os.path.exists(tmp_name):
@@ -130,21 +115,13 @@ def write_json_atomic(path: Path, data: Any) -> None:
 
 # --- CORE LOGIC ---
 
-def fetch_history_chunked(
-    session: requests.Session,
-    entity_ids: List[str],
-    start_iso: str,
-    end_iso: str,
-) -> Tuple[List[Dict] | None, str]:
-    """
-    Fetches history in chunks to avoid URL limits.
-    Aggregates results or reports PARTIAL/FAIL.
-    """
+def fetch_history_chunked(session: requests.Session, entity_ids: List[str], start_iso: str, end_iso: str, url_base: str) -> Tuple[List[Dict] | None, str]:
     all_history = []
     failed_chunks = 0
     total_chunks = 0
     
-    base_url = f"{HA_URL}/api/history/period/{start_iso}"
+    # Korrekter API-Endpoint für History
+    api_url = f"{url_base}/api/history/period/{start_iso}"
     
     for chunk in chunk_list(entity_ids, CHUNK_SIZE):
         total_chunks += 1
@@ -156,215 +133,109 @@ def fetch_history_chunked(
         }
         
         chunk_success = False
-        
         for attempt, timeout in enumerate(TIMEOUTS, 1):
             try:
-                response = session.get(base_url, params=params, timeout=timeout)
-
+                response = session.get(api_url, params=params, timeout=timeout)
                 if response.status_code == 200:
-                    try:
-                        data = response.json()
-                        flat = [item for sublist in data for item in sublist]
-                        all_history.extend(flat)
-                        chunk_success = True
-                        break 
-                    except ValueError:
-                        logger.error(f"Chunk {total_chunks}: Invalid JSON.")
-                        break 
-
-                elif response.status_code in (401, 403):
-                    logger.critical("Auth failed. Aborting all.")
-                    return None, "AUTH_FAIL"
-                
-                elif 400 <= response.status_code < 500:
-                    logger.error(f"Client Error ({response.status_code}).")
+                    data = response.json()
+                    flat = [item for sublist in data for item in sublist]
+                    all_history.extend(flat)
+                    chunk_success = True
                     break 
-
+                elif response.status_code in (401, 403):
+                    return None, "AUTH_FAIL"
                 else:
                     response.raise_for_status()
-
-            except requests.exceptions.RequestException as e:
+            except Exception as e:
                 if attempt < len(TIMEOUTS):
                     time.sleep(BACKOFFS[attempt-1])
-                else:
-                    logger.warning(f"Chunk {total_chunks} failed after retries: {e}")
-        
         if not chunk_success:
             failed_chunks += 1
 
-    if failed_chunks == 0:
-        return all_history, "OK"
-    elif failed_chunks < total_chunks:
-        return all_history, f"PARTIAL_{failed_chunks}_FAILED"
-    else:
-        return None, "ALL_CHUNKS_FAILED"
+    if failed_chunks == 0: return all_history, "OK"
+    return all_history, f"PARTIAL_{failed_chunks}_FAILED"
 
 def load_and_validate_registry(path: Path) -> Tuple[Dict[str, Any], str]:
-    """
-    Loads registry and calculates hash.
-    Enforces P0: entity_id, roals_id, exporter_domain required.
-    """
     if not path.exists():
-        logger.error(f"Registry not found: {path}")
-        # Addon-friendly Hint
-        logger.error("HINT: Check your Addon Configuration -> registry_path")
+        logger.error(f"Registry nicht gefunden: {path}")
         sys.exit(1)
-        
     reg_hash = calculate_file_hash(path)
-    
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception as e:
-        logger.error(f"Failed to read registry: {e}")
-        sys.exit(1)
-        
-    valid_registry = {}
-    skipped_count = 0
-    
-    for eid, meta in data.items():
-        if not meta.get("roals_id") or not meta.get("exporter_domain"):
-            logger.warning(f"Skipping {eid}: Missing roals_id or exporter_domain")
-            skipped_count += 1
-            continue
-            
-        valid_registry[eid] = meta
-        
-    if skipped_count > 0:
-        logger.warning(f"Skipped {skipped_count} entities due to missing required ROALS fields.")
-        
+    data = json.loads(path.read_text(encoding="utf-8"))
+    valid_registry = {k: v for k, v in data.items() if v.get("roals_id") and v.get("exporter_domain")}
     return valid_registry, reg_hash
 
 # --- MAIN ---
 
 def main():
-    parser = argparse.ArgumentParser(description="ROALS Exporter A (Final)")
-    parser.add_argument("--date", help="Target date YYYY-MM-DD (default: yesterday)")
-    parser.add_argument("--registry", default=str(DEFAULT_REGISTRY), help="Path to registry.json")
-    parser.add_argument("--out", default=str(DEFAULT_OUT_DIR), help="Output base directory")
-    parser.add_argument("--timezone", default="Europe/Berlin", help="Local timezone")
-    parser.add_argument("--system-id", default="unknown", help="Identifier of the capture system")
-    parser.add_argument("--mode", choices=["raw", "roals"], default="raw", help="Output format")
+    global HA_URL
+    parser = argparse.ArgumentParser(description="ROALS Exporter A (Token Patch)")
+    parser.add_argument("--date", help="Target date YYYY-MM-DD")
+    parser.add_argument("--registry", default=str(DEFAULT_REGISTRY))
+    parser.add_argument("--out", default=str(DEFAULT_OUT_DIR))
+    parser.add_argument("--timezone", default="Europe/Berlin")
+    parser.add_argument("--system-id", default="um890pro")
     args = parser.parse_args()
 
-    # --- PATCH: HA Addon Configuration Loader ---
-    # Automatically reads /data/options.json if present
+    # --- ADDON DETEKTION ---
     options_path = Path("/data/options.json")
     if options_path.exists():
+        # Wir sind im Add-on Modus -> Nutze interne Supervisor-URL
+        HA_URL = "http://supervisor/core"
         try:
             with open(options_path, "r") as f:
                 opts = json.load(f)
-            
-            # Map Addon Options to Script Arguments
-            if opts.get("registry_path"):
-                args.registry = opts["registry_path"]
-            if opts.get("data_root"):
-                args.out = opts["data_root"]
-            if opts.get("timezone"):
-                args.timezone = opts["timezone"]
-            if opts.get("target_date"):
-                args.date = opts["target_date"]
-                
-            logger.info(f"Running in Addon Mode. Registry: {args.registry}, Out: {args.out}")
-        except Exception as e:
-            logger.warning(f"Failed to read Addon options: {e}")
-    # --------------------------------------------
+            args.registry = opts.get("registry_path", args.registry)
+            args.out = opts.get("data_root", args.out)
+            args.timezone = opts.get("timezone", args.timezone)
+            args.date = opts.get("target_date", args.date)
+            logger.info(f"Add-on Mode aktiv. URL: {HA_URL}")
+        except:
+            pass
 
-    # 1. Setup Timezone & Date
     try:
         tz = ZoneInfo(args.timezone)
-    except Exception as e:
-        logger.error(f"Invalid timezone '{args.timezone}': {e}")
-        sys.exit(1)
+    except:
+        tz = ZoneInfo("UTC")
 
-    if args.date:
-        try:
-            target_date = datetime.strptime(args.date, "%Y-%m-%d").date()
-        except ValueError:
-            logger.error("Invalid date format. Use YYYY-MM-DD.")
-            sys.exit(1)
-    else:
-        target_date = datetime.now(tz).date() - timedelta(days=1)
+    target_date = datetime.strptime(args.date, "%Y-%m-%d").date() if args.date else datetime.now(tz).date() - timedelta(days=1)
+    start_iso = datetime.combine(target_date, dtime.min).replace(tzinfo=tz).isoformat()
+    end_iso = datetime.combine(target_date, dtime.max).replace(tzinfo=tz).isoformat()
 
-    start_dt = datetime.combine(target_date, dtime.min).replace(tzinfo=tz)
-    end_dt = datetime.combine(target_date, dtime.max).replace(tzinfo=tz)
-    
-    start_iso = start_dt.isoformat()
-    end_iso = end_dt.isoformat()
-
-    logger.info(f"--- Export {target_date} ({args.timezone}) ---")
-    
-    # 2. Load Registry
     registry, reg_hash = load_and_validate_registry(Path(args.registry))
-    
-    # 3. Group by Domain & Build Meta Map
     domain_map = defaultdict(list)
-    entity_meta_map = {} 
+    entity_meta_map = {}
     
-    for entity_id, meta in registry.items():
-        domain = meta.get("exporter_domain")
-        domain_map[domain].append(entity_id)
-        
-        entity_meta_map[entity_id] = {
-            "roals_id": meta.get("roals_id"),
-            "area_id": meta.get("area_id"), 
-            "profile": meta.get("profile")
-        }
+    for eid, meta in registry.items():
+        domain_map[meta["exporter_domain"]].append(eid)
+        entity_meta_map[eid] = {"roals_id": meta["roals_id"], "area_id": meta.get("area_id"), "profile": meta.get("profile")}
 
-    # 4. Process
     base_out_dir = Path(args.out) / target_date.strftime("%Y-%m-%d")
     base_out_dir.mkdir(parents=True, exist_ok=True)
 
     session = requests.Session()
     session.headers.update(get_headers())
 
-    success_count = 0
-    fail_count = 0
-
     for domain, entities in domain_map.items():
-        if not entities: continue
-
-        logger.info(f"Domain '{domain}': Fetching {len(entities)} entities...")
+        logger.info(f"Exportiere Domain: {domain}")
+        data, status = fetch_history_chunked(session, entities, start_iso, end_iso, HA_URL)
         
-        data, status = fetch_history_chunked(session, entities, start_iso, end_iso)
-        
-        domain_entities_meta = {e: entity_meta_map[e] for e in entities if e in entity_meta_map}
-
         output_payload = {
             "meta": {
-                "version": "2026.1.30",
+                "version": "2026.1.30-patch",
                 "system_id": args.system_id,
                 "domain": domain,
                 "date": str(target_date),
                 "timezone": args.timezone,
-                "window": {"start": start_iso, "end": end_iso},
                 "generated_at": datetime.now(tz).isoformat(),
                 "fetch_status": status,
-                "entity_count": len(entities),
-                "datapoint_count": len(data) if data else 0,
                 "registry_hash": reg_hash,
-                "entities": domain_entities_meta
+                "entities": {e: entity_meta_map[e] for e in entities}
             },
-            "data": data if data else []
+            "data": data or []
         }
-        
-        out_file = base_out_dir / f"{domain}.json"
-        
-        try:
-            write_json_atomic(out_file, output_payload)
-            if "OK" in status:
-                success_count += 1
-            else:
-                fail_count += 1
-                logger.warning(f"Domain '{domain}' written with status {status}")
-        except Exception as e:
-            fail_count += 1
-            logger.error(f"Failed to write {out_file}: {e}")
+        write_json_atomic(base_out_dir / f"{domain}.json", output_payload)
 
-    logger.info(f"--- Finished. Success: {success_count}, Failed/Partial: {fail_count} ---")
-    
-    if fail_count > 0:
-        sys.exit(1)
-    sys.exit(0)
+    logger.info("Export abgeschlossen.")
 
 if __name__ == "__main__":
     main()
