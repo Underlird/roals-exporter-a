@@ -1,6 +1,6 @@
 {
   "name": "ROALS Exporter A",
-  "version": "0.6.6",
+  "version": "0.6.7",
   "slug": "roals_exporter_a",
   "description": "Truth Layer Exporter - Registry-First mit Batch-Mode Support",
   "arch": ["amd64", "aarch64", "armv7", "armhf"],
@@ -34,3 +34,4 @@
     "registry_path": "str"
   }
 }
+
