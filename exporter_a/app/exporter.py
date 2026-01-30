@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 exporter.py - ROALS Exporter A (Truth Layer)
-Version: 2026.1.30-roals-final
+Version: 2026.1.30-roals-addon-patched
 
 Purpose:
 - Reads entity definitions from registry.json
@@ -9,6 +9,7 @@ Purpose:
 - Uses Adaptive Timeouts, Backoff & Chunking
 - Writes raw data to daily domain files using Atomic Writes
 - Enforces ROALS metadata presence (roals_id, exporter_domain)
+- Auto-detects HA Addon environment (/data/options.json)
 
 Usage:
   python3 exporter.py [--date YYYY-MM-DD] [--out ./data] [--timezone Europe/Berlin]
@@ -74,7 +75,6 @@ def calculate_file_hash(path: Path) -> str:
     """Calculates SHA-256 hash of a file for lineage tracking."""
     sha256_hash = hashlib.sha256()
     with open(path, "rb") as f:
-        # Read and update hash string value in blocks of 4K
         for byte_block in iter(lambda: f.read(4096), b""):
             sha256_hash.update(byte_block)
     return sha256_hash.hexdigest()
@@ -90,7 +90,7 @@ def write_json_atomic(path: Path, data: Any) -> None:
     Includes Safety Polish: UnboundLocalError protection & O_DIRECTORY flag.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_name = None # Polish 1: Init to avoid UnboundLocalError
+    tmp_name = None 
     
     try:
         fd, tmp_name = tempfile.mkstemp(
@@ -106,13 +106,10 @@ def write_json_atomic(path: Path, data: Any) -> None:
             f.flush()
             os.fsync(f.fileno())
             
-        # Atomic Move
         os.replace(tmp_name, str(path))
 
-        # Directory Sync (Durability)
         try:
             if hasattr(os, 'open') and hasattr(os, 'fsync'):
-                # Polish 2: Use O_DIRECTORY if available
                 flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
                 dir_fd = os.open(str(path.parent), flags)
                 try:
@@ -124,7 +121,6 @@ def write_json_atomic(path: Path, data: Any) -> None:
 
     except Exception as e:
         logger.error(f"Failed to write {path}: {e}")
-        # Polish 1: Check if tmp_name exists before cleanup
         if tmp_name and os.path.exists(tmp_name):
             try:
                 os.remove(tmp_name)
@@ -150,7 +146,6 @@ def fetch_history_chunked(
     
     base_url = f"{HA_URL}/api/history/period/{start_iso}"
     
-    # Iterate over chunks
     for chunk in chunk_list(entity_ids, CHUNK_SIZE):
         total_chunks += 1
         params = {
@@ -162,7 +157,6 @@ def fetch_history_chunked(
         
         chunk_success = False
         
-        # Retry Loop for this chunk
         for attempt, timeout in enumerate(TIMEOUTS, 1):
             try:
                 response = session.get(base_url, params=params, timeout=timeout)
@@ -170,14 +164,13 @@ def fetch_history_chunked(
                 if response.status_code == 200:
                     try:
                         data = response.json()
-                        # Flatten HA response
                         flat = [item for sublist in data for item in sublist]
                         all_history.extend(flat)
                         chunk_success = True
-                        break # Success, move to next chunk
+                        break 
                     except ValueError:
                         logger.error(f"Chunk {total_chunks}: Invalid JSON.")
-                        break # No retry on bad json
+                        break 
 
                 elif response.status_code in (401, 403):
                     logger.critical("Auth failed. Aborting all.")
@@ -185,10 +178,10 @@ def fetch_history_chunked(
                 
                 elif 400 <= response.status_code < 500:
                     logger.error(f"Client Error ({response.status_code}).")
-                    break # No retry
+                    break 
 
                 else:
-                    response.raise_for_status() # 5xx -> Retry
+                    response.raise_for_status()
 
             except requests.exceptions.RequestException as e:
                 if attempt < len(TIMEOUTS):
@@ -199,7 +192,6 @@ def fetch_history_chunked(
         if not chunk_success:
             failed_chunks += 1
 
-    # Determine Final Status
     if failed_chunks == 0:
         return all_history, "OK"
     elif failed_chunks < total_chunks:
@@ -214,9 +206,10 @@ def load_and_validate_registry(path: Path) -> Tuple[Dict[str, Any], str]:
     """
     if not path.exists():
         logger.error(f"Registry not found: {path}")
+        # Addon-friendly Hint
+        logger.error("HINT: Check your Addon Configuration -> registry_path")
         sys.exit(1)
         
-    # Calculate Hash first (Source of Truth Lineage)
     reg_hash = calculate_file_hash(path)
     
     try:
@@ -229,7 +222,6 @@ def load_and_validate_registry(path: Path) -> Tuple[Dict[str, Any], str]:
     skipped_count = 0
     
     for eid, meta in data.items():
-        # P0: Strict Fields
         if not meta.get("roals_id") or not meta.get("exporter_domain"):
             logger.warning(f"Skipping {eid}: Missing roals_id or exporter_domain")
             skipped_count += 1
@@ -249,10 +241,33 @@ def main():
     parser.add_argument("--date", help="Target date YYYY-MM-DD (default: yesterday)")
     parser.add_argument("--registry", default=str(DEFAULT_REGISTRY), help="Path to registry.json")
     parser.add_argument("--out", default=str(DEFAULT_OUT_DIR), help="Output base directory")
-    parser.add_argument("--timezone", default="Europe/Berlin", help="Local timezone (e.g. Asia/Manila)")
+    parser.add_argument("--timezone", default="Europe/Berlin", help="Local timezone")
     parser.add_argument("--system-id", default="unknown", help="Identifier of the capture system")
-    parser.add_argument("--mode", choices=["raw", "roals"], default="raw", help="Output format (raw=HA History, roals=Reserved)")
+    parser.add_argument("--mode", choices=["raw", "roals"], default="raw", help="Output format")
     args = parser.parse_args()
+
+    # --- PATCH: HA Addon Configuration Loader ---
+    # Automatically reads /data/options.json if present
+    options_path = Path("/data/options.json")
+    if options_path.exists():
+        try:
+            with open(options_path, "r") as f:
+                opts = json.load(f)
+            
+            # Map Addon Options to Script Arguments
+            if opts.get("registry_path"):
+                args.registry = opts["registry_path"]
+            if opts.get("data_root"):
+                args.out = opts["data_root"]
+            if opts.get("timezone"):
+                args.timezone = opts["timezone"]
+            if opts.get("target_date"):
+                args.date = opts["target_date"]
+                
+            logger.info(f"Running in Addon Mode. Registry: {args.registry}, Out: {args.out}")
+        except Exception as e:
+            logger.warning(f"Failed to read Addon options: {e}")
+    # --------------------------------------------
 
     # 1. Setup Timezone & Date
     try:
@@ -268,14 +283,11 @@ def main():
             logger.error("Invalid date format. Use YYYY-MM-DD.")
             sys.exit(1)
     else:
-        # Default: Capture yesterday relative to the timezone
         target_date = datetime.now(tz).date() - timedelta(days=1)
 
-    # Time window (Midnight to Midnight in local TZ)
     start_dt = datetime.combine(target_date, dtime.min).replace(tzinfo=tz)
     end_dt = datetime.combine(target_date, dtime.max).replace(tzinfo=tz)
     
-    # Convert to ISO (HA expects simple ISO or UTC)
     start_iso = start_dt.isoformat()
     end_iso = end_dt.isoformat()
 
@@ -286,24 +298,22 @@ def main():
     
     # 3. Group by Domain & Build Meta Map
     domain_map = defaultdict(list)
-    entity_meta_map = {} # Context for meta block
+    entity_meta_map = {} 
     
     for entity_id, meta in registry.items():
         domain = meta.get("exporter_domain")
         domain_map[domain].append(entity_id)
         
-        # P0: Metadata Mapping (keep it minimal but useful)
         entity_meta_map[entity_id] = {
             "roals_id": meta.get("roals_id"),
-            "area_id": meta.get("area_id"), # Optional
-            "profile": meta.get("profile")  # Optional
+            "area_id": meta.get("area_id"), 
+            "profile": meta.get("profile")
         }
 
     # 4. Process
     base_out_dir = Path(args.out) / target_date.strftime("%Y-%m-%d")
     base_out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Init Session
     session = requests.Session()
     session.headers.update(get_headers())
 
@@ -317,10 +327,8 @@ def main():
         
         data, status = fetch_history_chunked(session, entities, start_iso, end_iso)
         
-        # Filter entity_meta_map to only include entities in this domain
         domain_entities_meta = {e: entity_meta_map[e] for e in entities if e in entity_meta_map}
 
-        # P0: Rich Metadata
         output_payload = {
             "meta": {
                 "version": "2026.1.30",
@@ -334,7 +342,7 @@ def main():
                 "entity_count": len(entities),
                 "datapoint_count": len(data) if data else 0,
                 "registry_hash": reg_hash,
-                "entities": domain_entities_meta # ROALS Context
+                "entities": domain_entities_meta
             },
             "data": data if data else []
         }
@@ -360,3 +368,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
