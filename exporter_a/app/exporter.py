@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
 """
 exporter.py - ROALS Exporter A (Daily Truth Engine)
-Version: 2026.02.04-ROALS-PLATINUM
+Version: 2026.02.05-ROALS-PLATINUM-HARDENED
 
 Features:
 - Primary: daily_truth (288-slot 5min timeseries)
 - Optional: raw_snapshot (FULL forensic event dump with attributes)
 - Registry-First: Enforces roals_id and domain strictness upfront
-- Data Types: Robust Numeric and Binary State (0/1) mapping (Strict Mode)
-- Durable: Atomic writes with defensive cleanup and unique filenames
-- Forensic: SHA-256 integrity hashing & rich metadata
+- Robustness: JSON-Safety, Exponential Backoff, clean binary detection
 - Platinum: Self-describing raster & embedded data quality summary
 """
 
@@ -25,7 +23,7 @@ import requests
 from collections import defaultdict
 from datetime import datetime, timedelta, time as dtime
 from pathlib import Path
-from typing import Any, Dict, List, Tuple, Generator, Optional
+from typing import Any, Dict, List, Tuple, Generator, Optional, Callable
 
 try:
     from zoneinfo import ZoneInfo
@@ -94,12 +92,41 @@ def normalize_policy(policy: str) -> str:
     if p in ("avg", "average"): return "mean"
     return p
 
+# --- Helper: Binary Detection ---
+def detect_binary_mode(eid: str, kind: str, profile: str) -> bool:
+    """Determines if an entity should be treated as binary (0/1)."""
+    if kind == "event_state":
+        return True
+    if eid.startswith("binary_sensor."):
+        return True
+    if "contact_state" in profile or "binary_state" in profile:
+        return True
+    return False
+
+# --- Helper: Policy Strategies ---
+def policy_max(vals): return max(vals)
+def policy_min(vals): return min(vals)
+def policy_sum(vals): return sum(vals)
+def policy_mean(vals): return round(sum(vals) / len(vals), 4)
+def policy_last(vals): return vals[-1]
+
+POLICY_MAP: Dict[str, Callable] = {
+    "max": policy_max,
+    "min": policy_min,
+    "sum": policy_sum,
+    "mean": policy_mean,
+    "last": policy_last
+}
+
 def map_events_to_slots(events: List[Dict], start_dt: datetime, raw_policy: str, is_binary: bool) -> List[Any]:
     slots = [None] * SLOTS_PER_DAY
     parsed_events = []
     
-    policy = normalize_policy(raw_policy)
+    policy_key = normalize_policy(raw_policy)
+    # Default to 'last' if policy unknown
+    agg_func = POLICY_MAP.get(policy_key, policy_last)
 
+    # 1. Parse Events
     for e in events:
         state = e.get("state")
         if state in (None, "unknown", "unavailable", ""): continue
@@ -119,20 +146,24 @@ def map_events_to_slots(events: List[Dict], start_dt: datetime, raw_policy: str,
     
     parsed_events.sort(key=lambda x: x[0])
     
+    # 2. Linear Slotting
     event_idx = 0
     num_events = len(parsed_events)
     last_known = None
 
+    # LOCF Initialization
     while event_idx < num_events and parsed_events[event_idx][0] <= start_dt:
         last_known = parsed_events[event_idx][1]
         event_idx += 1
+    
+    # Pre-calc slot duration
+    slot_delta = timedelta(minutes=RASTER_MINUTES)
+    current_slot_end = start_dt + slot_delta
 
     for i in range(SLOTS_PER_DAY):
-        slot_end = start_dt + timedelta(minutes=(i + 1) * RASTER_MINUTES)
-        
         vals_in_slot = []
         
-        while event_idx < num_events and parsed_events[event_idx][0] <= slot_end:
+        while event_idx < num_events and parsed_events[event_idx][0] <= current_slot_end:
             val = parsed_events[event_idx][1]
             vals_in_slot.append(val)
             last_known = val
@@ -141,16 +172,14 @@ def map_events_to_slots(events: List[Dict], start_dt: datetime, raw_policy: str,
         if not vals_in_slot:
             if last_known is not None:
                 slots[i] = last_known
-            continue
-        
-        if is_binary:
-            slots[i] = vals_in_slot[-1]
+            # Else remains None
         else:
-            if policy == "max": slots[i] = max(vals_in_slot)
-            elif policy == "min": slots[i] = min(vals_in_slot)
-            elif policy == "mean": slots[i] = round(sum(vals_in_slot) / len(vals_in_slot), 4)
-            elif policy == "sum": slots[i] = sum(vals_in_slot)
-            else: slots[i] = vals_in_slot[-1]
+            if is_binary:
+                slots[i] = vals_in_slot[-1]
+            else:
+                slots[i] = agg_func(vals_in_slot)
+        
+        current_slot_end += slot_delta
             
     return slots
 
@@ -173,15 +202,29 @@ def fetch_history(session, entity_ids, start_dt, end_dt, ha_url, mode):
             try:
                 resp = session.get(url, params=params, timeout=60)
                 if resp.status_code == 200:
-                    for entity_list in resp.json():
-                        if entity_list: all_data[entity_list[0]["entity_id"]] = entity_list
+                    # Robustness: Safe JSON parsing
+                    data = resp.json()
+                    for entity_list in data:
+                        if entity_list and len(entity_list) > 0:
+                            eid = entity_list[0].get("entity_id")
+                            if eid:
+                                all_data[eid] = entity_list
                     break
                 elif resp.status_code in (401, 403):
                     logger.error("Auth failed.")
                     sys.exit(1)
-            except Exception as e:
-                if attempt == 3: logger.error(f"Chunk fetch failed: {e}")
-                time.sleep(2)
+                else:
+                    logger.warning(f"API Error {resp.status_code}")
+                    # Allow retry on 5xx
+            except (json.JSONDecodeError, requests.RequestException, IndexError, KeyError) as e:
+                logger.warning(f"Chunk fetch error (attempt {attempt}): {e}")
+            
+            if attempt < 3:
+                # Exponential Backoff: 1s, 2s, 4s
+                time.sleep(2 ** (attempt - 1))
+            else:
+                logger.error("Chunk failed after 3 retries.")
+                
     return all_data
 
 def main():
@@ -261,7 +304,8 @@ def main():
     if skipped_count > 0:
         logger.warning(f"Skipped {skipped_count} registry entries (missing roals_id/domain).")
     
-    available_domains = sorted(list(set(m["exporter_domain"] for m in valid_registry.values())))
+    # Performance: sorted set
+    available_domains = sorted(set(m["exporter_domain"] for m in valid_registry.values()))
     target_domains = []
     
     if args.all_domains:
@@ -312,36 +356,27 @@ def main():
                 }
                 
                 for eid, m in entities.items():
-                    # Patch A: Tolerant Context Reading
                     meta_block["entities"][eid] = {
                         "roals_id": m.get("roals_id"),
                         "area_id": m.get("area_id"),
-                        "room_id": m.get("room_id"), # Optional added
+                        "room_id": m.get("room_id"),
                         "profile": m.get("profile")
                     }
 
                 if args.mode == "daily_truth":
-                    ts_iso = [(start_dt + timedelta(minutes=RASTER_MINUTES*i)).isoformat() for i in range(SLOTS_PER_DAY)]
+                    ts_iso = [(start_dt + timedelta(minutes=5*i)).isoformat() for i in range(SLOTS_PER_DAY)]
                     timeseries = {"ts_iso": ts_iso}
                     
                     for eid, meta in entities.items():
-                        # Patch A: Tolerant Reading
                         metric = meta.get("metric", {})
-                        # Fallback logic: metric.agg_policy.primary OR agg_policy.primary
+                        # Refactored Policy Access
                         policy = metric.get("agg_policy", {}).get("primary") or meta.get("agg_policy", {}).get("primary", "last")
                         
                         kind = metric.get("kind") or meta.get("kind", "numeric")
                         profile = str(meta.get("profile", "")).lower()
                         
-                        # Patch A: Hard Binary Detection
-                        is_binary = False
-                        if kind == "event_state":
-                            is_binary = True
-                        elif eid.startswith("binary_sensor."):
-                            is_binary = True
-                        elif "contact_state" in profile or "binary_state" in profile:
-                             # Fallback only
-                            is_binary = True
+                        # Refactored Binary Detection
+                        is_binary = detect_binary_mode(eid, kind, profile)
                         
                         timeseries[eid] = map_events_to_slots(
                             raw_history.get(eid, []), 
@@ -349,16 +384,13 @@ def main():
                             policy, 
                             is_binary
                         )
+                    
                     payload = {"meta": meta_block, "timeseries": timeseries}
 
-                    # --- ROALS PLATINUM PATCH (Nara P0.4 & P1) ---
-                    # P0.4: Explicit Raster Metadata
-                    payload["meta"]["raster_minutes"] = RASTER_MINUTES
-                    payload["meta"]["slots_per_day"] = SLOTS_PER_DAY
-
-                    # P1: Quality & Diagnostics Block
+                    # --- PLATINUM SUMMARY ---
                     summary = {
-                        "entities_total": len(meta_block["entities"]),
+                        "generated_at": datetime.now(tz).isoformat(),
+                        "total_entities": len(entities),
                         "columns_total": 0,
                         "worst_coverage_pct": 100.0,
                         "columns": {}
@@ -383,7 +415,7 @@ def main():
 
                     summary["columns_total"] = col_count
                     payload["summary"] = summary
-                    # --- END PLATINUM PATCH ---
+                    # --- END SUMMARY ---
 
                 else:
                     payload = {"meta": meta_block, "data": raw_history}
