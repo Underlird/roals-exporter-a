@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 exporter.py - ROALS Exporter A (Daily Truth Engine)
-Version: 2026.02.04-ROALS-FINAL-HARDENED
+Version: 2026.02.04-ROALS-PLATINUM
 
 Features:
 - Primary: daily_truth (288-slot 5min timeseries)
@@ -10,6 +10,7 @@ Features:
 - Data Types: Robust Numeric and Binary State (0/1) mapping (Strict Mode)
 - Durable: Atomic writes with defensive cleanup and unique filenames
 - Forensic: SHA-256 integrity hashing & rich metadata
+- Platinum: Self-describing raster & embedded data quality summary
 """
 
 import argparse
@@ -320,7 +321,7 @@ def main():
                     }
 
                 if args.mode == "daily_truth":
-                    ts_iso = [(start_dt + timedelta(minutes=5*i)).isoformat() for i in range(SLOTS_PER_DAY)]
+                    ts_iso = [(start_dt + timedelta(minutes=RASTER_MINUTES*i)).isoformat() for i in range(SLOTS_PER_DAY)]
                     timeseries = {"ts_iso": ts_iso}
                     
                     for eid, meta in entities.items():
@@ -349,6 +350,41 @@ def main():
                             is_binary
                         )
                     payload = {"meta": meta_block, "timeseries": timeseries}
+
+                    # --- ROALS PLATINUM PATCH (Nara P0.4 & P1) ---
+                    # P0.4: Explicit Raster Metadata
+                    payload["meta"]["raster_minutes"] = RASTER_MINUTES
+                    payload["meta"]["slots_per_day"] = SLOTS_PER_DAY
+
+                    # P1: Quality & Diagnostics Block
+                    summary = {
+                        "entities_total": len(meta_block["entities"]),
+                        "columns_total": 0,
+                        "worst_coverage_pct": 100.0,
+                        "columns": {}
+                    }
+
+                    col_count = 0
+                    for col_name, values in timeseries.items():
+                        if col_name == "ts_iso": continue
+                        
+                        col_count += 1
+                        valid_points = sum(1 for v in values if v is not None)
+                        coverage = round((valid_points / SLOTS_PER_DAY) * 100, 1)
+                        
+                        summary["columns"][col_name] = {
+                            "valid_points": valid_points,
+                            "null_points": SLOTS_PER_DAY - valid_points,
+                            "coverage_pct": coverage
+                        }
+                        
+                        if coverage < summary["worst_coverage_pct"]:
+                            summary["worst_coverage_pct"] = coverage
+
+                    summary["columns_total"] = col_count
+                    payload["summary"] = summary
+                    # --- END PLATINUM PATCH ---
+
                 else:
                     payload = {"meta": meta_block, "data": raw_history}
 
