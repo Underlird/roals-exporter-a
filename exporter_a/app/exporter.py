@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """
 exporter.py - ROALS Exporter A (Daily Truth Engine)
-Version: 2026.02.05-ROALS-PLATINUM-HARDENED
+Version: 2026.02.05-ROALS-HYBRID-TRUTH (V2.2)
 
 Features:
 - Primary: daily_truth (288-slot 5min timeseries)
-- Optional: raw_snapshot (FULL forensic event dump with attributes)
+- Hybrid: Embedded precise event metrics (seconds/count) for binary sensors
 - Registry-First: Enforces roals_id and domain strictness upfront
 - Robustness: JSON-Safety, Exponential Backoff, clean binary detection
-- Platinum: Self-describing raster & embedded data quality summary
 """
 
 import argparse
@@ -118,12 +117,14 @@ POLICY_MAP: Dict[str, Callable] = {
     "last": policy_last
 }
 
-def map_events_to_slots(events: List[Dict], start_dt: datetime, raw_policy: str, is_binary: bool) -> List[Any]:
+def map_events_to_slots(events: List[Dict], start_dt: datetime, raw_policy: str, is_binary: bool) -> Tuple[List[Any], Dict]:
     slots = [None] * SLOTS_PER_DAY
     parsed_events = []
     
+    # Hybrid Truth Stats
+    stats = {"total_open_seconds": 0, "toggle_count": 0}
+    
     policy_key = normalize_policy(raw_policy)
-    # Default to 'last' if policy unknown
     agg_func = POLICY_MAP.get(policy_key, policy_last)
 
     # 1. Parse Events
@@ -146,17 +147,49 @@ def map_events_to_slots(events: List[Dict], start_dt: datetime, raw_policy: str,
     
     parsed_events.sort(key=lambda x: x[0])
     
-    # 2. Linear Slotting
+    # 2. Precise Duration Calculation (Hybrid)
+    if is_binary and parsed_events:
+        stats["toggle_count"] = len(parsed_events)
+        
+        # Calculate precise open duration within the 24h window
+        last_ts = start_dt
+        last_val = 0 # Assume closed at start (safe default)
+        
+        # Initialize last_val correctly if there are events before start
+        # Find the latest event before start_dt to set initial state
+        prior_events = [e for e in parsed_events if e[0] <= start_dt]
+        if prior_events:
+            last_val = prior_events[-1][1]
+        
+        # We iterate through time
+        # Merge relevant events for duration calculation
+        relevant_events = [e for e in parsed_events if e[0] > start_dt]
+        
+        for ts, val in relevant_events:
+            if ts > start_dt and ts < (start_dt + timedelta(days=1)):
+                if last_val == 1:
+                    duration = (ts - last_ts).total_seconds()
+                    stats["total_open_seconds"] += max(0, duration)
+            last_ts = ts
+            last_val = val
+            
+        # Add remaining time until end of day if still open
+        if last_val == 1:
+            end_dt = start_dt + timedelta(days=1)
+            # Ensure we don't count past end_dt
+            effective_end = min(end_dt, datetime.now(start_dt.tzinfo) if start_dt.date() == datetime.now().date() else end_dt)
+            if last_ts < effective_end:
+                 stats["total_open_seconds"] += max(0, (effective_end - last_ts).total_seconds())
+
+    # 3. Linear Slotting (The Standard 288 Grid)
     event_idx = 0
     num_events = len(parsed_events)
     last_known = None
 
-    # LOCF Initialization
     while event_idx < num_events and parsed_events[event_idx][0] <= start_dt:
         last_known = parsed_events[event_idx][1]
         event_idx += 1
     
-    # Pre-calc slot duration
     slot_delta = timedelta(minutes=RASTER_MINUTES)
     current_slot_end = start_dt + slot_delta
 
@@ -172,7 +205,6 @@ def map_events_to_slots(events: List[Dict], start_dt: datetime, raw_policy: str,
         if not vals_in_slot:
             if last_known is not None:
                 slots[i] = last_known
-            # Else remains None
         else:
             if is_binary:
                 slots[i] = vals_in_slot[-1]
@@ -181,7 +213,7 @@ def map_events_to_slots(events: List[Dict], start_dt: datetime, raw_policy: str,
         
         current_slot_end += slot_delta
             
-    return slots
+    return slots, stats
 
 def fetch_history(session, entity_ids, start_dt, end_dt, ha_url, mode):
     all_data = defaultdict(list)
@@ -202,7 +234,6 @@ def fetch_history(session, entity_ids, start_dt, end_dt, ha_url, mode):
             try:
                 resp = session.get(url, params=params, timeout=60)
                 if resp.status_code == 200:
-                    # Robustness: Safe JSON parsing
                     data = resp.json()
                     for entity_list in data:
                         if entity_list and len(entity_list) > 0:
@@ -215,12 +246,10 @@ def fetch_history(session, entity_ids, start_dt, end_dt, ha_url, mode):
                     sys.exit(1)
                 else:
                     logger.warning(f"API Error {resp.status_code}")
-                    # Allow retry on 5xx
             except (json.JSONDecodeError, requests.RequestException, IndexError, KeyError) as e:
                 logger.warning(f"Chunk fetch error (attempt {attempt}): {e}")
             
             if attempt < 3:
-                # Exponential Backoff: 1s, 2s, 4s
                 time.sleep(2 ** (attempt - 1))
             else:
                 logger.error("Chunk failed after 3 retries.")
@@ -304,7 +333,6 @@ def main():
     if skipped_count > 0:
         logger.warning(f"Skipped {skipped_count} registry entries (missing roals_id/domain).")
     
-    # Performance: sorted set
     available_domains = sorted(set(m["exporter_domain"] for m in valid_registry.values()))
     target_domains = []
     
@@ -367,23 +395,25 @@ def main():
                     ts_iso = [(start_dt + timedelta(minutes=5*i)).isoformat() for i in range(SLOTS_PER_DAY)]
                     timeseries = {"ts_iso": ts_iso}
                     
+                    # Store Metrics separately
+                    daily_metrics = {}
+                    
                     for eid, meta in entities.items():
                         metric = meta.get("metric", {})
-                        # Refactored Policy Access
                         policy = metric.get("agg_policy", {}).get("primary") or meta.get("agg_policy", {}).get("primary", "last")
-                        
                         kind = metric.get("kind") or meta.get("kind", "numeric")
                         profile = str(meta.get("profile", "")).lower()
-                        
-                        # Refactored Binary Detection
                         is_binary = detect_binary_mode(eid, kind, profile)
                         
-                        timeseries[eid] = map_events_to_slots(
+                        slots, stats = map_events_to_slots(
                             raw_history.get(eid, []), 
                             start_dt, 
                             policy, 
                             is_binary
                         )
+                        timeseries[eid] = slots
+                        if is_binary and stats["toggle_count"] > 0:
+                            daily_metrics[eid] = stats
                     
                     payload = {"meta": meta_block, "timeseries": timeseries}
 
@@ -409,6 +439,10 @@ def main():
                             "null_points": SLOTS_PER_DAY - valid_points,
                             "coverage_pct": coverage
                         }
+                        
+                        # HYBRID PATCH: Inject Event Metrics
+                        if col_name in daily_metrics:
+                            summary["columns"][col_name]["event_metrics"] = daily_metrics[col_name]
                         
                         if coverage < summary["worst_coverage_pct"]:
                             summary["worst_coverage_pct"] = coverage
