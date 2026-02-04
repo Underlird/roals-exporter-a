@@ -340,13 +340,20 @@ def main():
         target_domains = available_domains
         logger.info(f"Processing ALL {len(target_domains)} domains.")
     elif args.domain:
-        if args.domain in available_domains:
-            target_domains = [args.domain]
-        else:
-            logger.warning(f"Domain '{args.domain}' empty or not in valid registry.")
+        # NEU: Split by comma to allow multiple domains (e.g. "security, energy")
+        requested_domains = [d.strip() for d in args.domain.split(",") if d.strip()]
+        
+        for d in requested_domains:
+            if d in available_domains:
+                target_domains.append(d)
+            else:
+                logger.warning(f"Domain '{d}' skipped: Not found in valid registry. (Available: {available_domains})")
+                
+        if not target_domains:
+             logger.warning(f"Input '{args.domain}' produced no valid target domains.")
     
     if not target_domains:
-        logger.error("No valid domains selected.")
+        logger.error("No valid domains selected. Please check 'exporter_domain' or use 'process_all_domains'.")
         sys.exit(1)
 
     session = requests.Session()
