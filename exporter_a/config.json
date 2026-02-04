@@ -1,6 +1,6 @@
 {
   "name": "ROALS Exporter A",
-  "version": "0.8.9",
+  "version": "0.9.0",
   "slug": "roals_exporter_a",
   "description": "ROALS Truth Layer - Daily Truth (288 Slots) mit Multi-Domain Support",
   "arch": ["amd64", "aarch64", "armv7", "armhf"],
