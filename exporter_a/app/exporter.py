@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
 exporter.py - ROALS Exporter A (Daily Truth Engine)
-Version: 2026.02.05-ROALS-HYBRID-TRUTH (V2.2)
+Version: 2026.02.05-ROALS-HYBRID-TRUTH (V2.3)
 
 Features:
 - Primary: daily_truth (288-slot 5min timeseries)
 - Hybrid: Embedded precise event metrics (seconds/count) for binary sensors
+- Multi-Domain: Supports multi_select (list) and CLI (string) inputs
 - Registry-First: Enforces roals_id and domain strictness upfront
 - Robustness: JSON-Safety, Exponential Backoff, clean binary detection
 """
@@ -179,7 +180,7 @@ def map_events_to_slots(events: List[Dict], start_dt: datetime, raw_policy: str,
             # Ensure we don't count past end_dt
             effective_end = min(end_dt, datetime.now(start_dt.tzinfo) if start_dt.date() == datetime.now().date() else end_dt)
             if last_ts < effective_end:
-                 stats["total_open_seconds"] += max(0, (effective_end - last_ts).total_seconds())
+                stats["total_open_seconds"] += max(0, (effective_end - last_ts).total_seconds())
 
     # 3. Linear Slotting (The Standard 288 Grid)
     event_idx = 0
@@ -285,6 +286,7 @@ def main():
                 if opts.get("process_all_domains"):
                     args.all_domains = True
                 else:
+                    # Reads the list or string directly from options.json
                     args.domain = opts.get("exporter_domain")
                 
                 if opts.get("start_date") and opts.get("end_date"):
@@ -340,8 +342,13 @@ def main():
         target_domains = available_domains
         logger.info(f"Processing ALL {len(target_domains)} domains.")
     elif args.domain:
-        # NEU: Split by comma to allow multiple domains (e.g. "security, energy")
-        requested_domains = [d.strip() for d in args.domain.split(",") if d.strip()]
+        # --- MULTI DOMAIN PATCH ---
+        # Handle list (Addon multi_select) vs String (CLI comma-separated)
+        if isinstance(args.domain, list):
+            requested_domains = args.domain
+        else:
+            # Fallback for manual CLI usage: "security,energy"
+            requested_domains = [d.strip() for d in str(args.domain).split(",") if d.strip()]
         
         for d in requested_domains:
             if d in available_domains:
