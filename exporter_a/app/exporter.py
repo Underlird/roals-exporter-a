@@ -98,10 +98,13 @@ def main():
         with open(opt_path) as f:
             o = json.load(f)
             args.registry, args.out, args.timezone, args.mode = o.get("registry_path", args.registry), o.get("data_root", args.out), o.get("timezone", args.timezone), o.get("run_mode", args.mode)
-            if o.get("process_all_domains"): args.all_domains = True
-            else: args.domain = o.get("exporter_domain")
+            if o.get("process_all_domains"): 
+                args.all_domains = True
+            else: 
+                args.domain = o.get("exporter_domain")
             if o.get("start_date") and o.get("end_date"): args.start_date, args.end_date = o["start_date"], o["end_date"]
             else: args.date = o.get("target_date")
+    
     tz = ZoneInfo(args.timezone)
     dates = []
     if args.start_date and args.end_date:
@@ -109,14 +112,40 @@ def main():
         while curr <= datetime.strptime(args.end_date, "%Y-%m-%d").date(): dates.append(curr); curr += timedelta(days=1)
     elif args.date: dates.append(datetime.strptime(args.date, "%Y-%m-%d").date())
     else: dates.append(datetime.now(tz).date() - timedelta(days=1))
+    
     with open(args.registry) as f: raw_reg = json.load(f)
     reg = {e: m for e, m in raw_reg.items() if m.get("roals_id") and m.get("exporter_domain")}
     avail = sorted(set(m["exporter_domain"] for m in reg.values()))
-    targets = avail if args.all_domains else []
-    if not args.all_domains and args.domain:
-        req = args.domain if isinstance(args.domain, list) else [d.strip() for d in str(args.domain).split(",") if d.strip()]
-        targets = [d for d in req if d in avail]
-    if not targets: sys.exit(1)
+    
+    # --- SMART DOMAIN SELECTION (v0.9.0) ---
+    targets = []
+    
+    if args.all_domains:
+        targets = avail
+        logger.info(f"Processing ALL domains: {len(targets)}")
+    else:
+        if args.domain:
+            # User hat Domain(s) ausgewählt
+            req = args.domain if isinstance(args.domain, list) else [d.strip() for d in str(args.domain).split(",") if d.strip()]
+            targets = [d for d in req if d in avail]
+            
+            if not targets and req:
+                logger.warning(f"Selected domains {req} not in registry. Available: {avail}")
+        
+        if not targets:
+            # FALLBACK: Auto-select erste Domain
+            if avail:
+                targets = [avail[0]]
+                logger.info(f"No domain selected, auto-using first available: {targets[0]}")
+            else:
+                logger.error("No valid domains in registry")
+                sys.exit(1)
+    
+    if not targets:
+        logger.error("No domains to process")
+        sys.exit(1)
+    # --- END SMART DOMAIN SELECTION ---
+    
     sess = requests.Session(); sess.headers.update(get_headers())
     for d in dates:
         s_dt = datetime.combine(d, dtime.min).replace(tzinfo=tz)
