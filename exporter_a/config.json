@@ -1,8 +1,8 @@
 {
   "name": "ROALS Exporter A",
-  "version": "0.9.2",
+  "version": "0.9.3",
   "slug": "roals_exporter_a",
-  "description": "ROALS Truth Layer - Daily Truth (288 Slots) mit Multi-Domain Support",
+  "description": "ROALS Truth Layer - V2.9 Platinum Gatekeeper Edition",
   "arch": ["amd64", "aarch64", "armv7", "armhf"],
   "startup": "once",
   "boot": "manual",
@@ -19,7 +19,9 @@
     "log_level": "INFO",
     "timezone": "Asia/Manila",
     "data_root": "/share/nara_data",
-    "registry_path": "/share/nara_data/registry/entity_registry.json"
+    "registry_path": "/share/nara_data/registry/entity_registry.json",
+    "gatekeeper_entity": "binary_sensor.eg_data_ingest_ok",
+    "enforce_gatekeeper": false
   },
   "schema": {
     "run_mode": "list(daily_truth|raw_snapshot)",
@@ -28,9 +30,11 @@
     "target_date": "str?",
     "start_date": "str?",
     "end_date": "str?",
-    "log_level": "list(DEBUG|INFO|WARNING|ERROR)",
+    "log_level": "list(DEBUG|INFO|WARNING|ERROR|CRITICAL)",
     "timezone": "str",
     "data_root": "str",
-    "registry_path": "str"
+    "registry_path": "str",
+    "gatekeeper_entity": "str?",
+    "enforce_gatekeeper": "bool?"
   }
 }
