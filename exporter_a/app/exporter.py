@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
 """
 exporter.py - ROALS Exporter A (Platinum Truth Engine)
-Version: V2.8 - Platinum Forensic Edition
+Version: V2.9 - Gatekeeper Edition
 
-Changes V2.7 → V2.8:
-- Patch 1: meta.generated_at added (ISO timestamp) → fixes Deep Dive L2 warning
-- Patch 2: ts_iso excluded from summary.columns → fixes Deep Dive L3 ghost sensor warning
-- Patch 3: Version branding unified to V2.8
-- Patch 4: Integrity hash covers all fields including generated_at
-- Optimization: meta.window block added (start/end timestamps for Aggregator compatibility)
-- Optimization: meta.registry_hash added (SHA-256 of registry for consistency tracking)
-- Optimization: summary.columns includes valid_count for Deep Dive L3 cross-check
-- Optimization: Windows Unicode fix for Cockpit subprocess compatibility
-- Compatibility: 100% backward compatible with V2.7 consumers
+Changes V2.8.1 → V2.9:
+- NEW: Gatekeeper mechanism to detect and null-out stale "zombie" data
+  caused by infrastructure issues (e.g. hung Zigbee bridges).
+  The exporter queries a configurable binary_sensor that reflects
+  ingest-infrastructure health. If the gatekeeper was "off" or
+  "unavailable" during a slot, the sensor value is forced to None.
+- NEW: meta block includes gatekeeper_active, gatekeeper_entity,
+  and gatekeeper_slots_nulled for full provenance.
+- Config fields: exporter.gatekeeper_entity, exporter.enforce_gatekeeper
+- Gatekeeper failure (entity not found / API error) is non-fatal:
+  logged as WARNING, run continues without nulling.
+
+Changes V2.8 → V2.8.1:
+- Fix: Default --registry path changed from "registry.json" to "entity_registry.json"
+- Fix: Integrity hash uses ensure_ascii=False for consistency with Aggregator
 """
 
 import argparse
@@ -57,8 +62,8 @@ except ImportError:
 
 # ─── ROALS Constants ──────────────────────────────────────────────────────────
 
-VERSION = "V2.8 - Platinum Forensic Edition"
-SCHEMA_VERSION = "2.8"
+VERSION = "V2.9 - Gatekeeper Edition"
+SCHEMA_VERSION = "2.9"
 SLOTS_PER_DAY = 288
 RASTER_MINUTES = 5
 BINARY_TRUE_VALUES = {"on", "open", "true", "detected", "home", "active", "occupied"}
@@ -93,27 +98,25 @@ def calculate_integrity_hash(data: dict) -> str:
 
     CRITICAL: This function must remain identical across Exporter, Deep Dive,
     and Aggregator. Any change here breaks all existing hashes.
+
+    V2.8.1: Added ensure_ascii=False for consistency with Aggregator.
     """
     d = data.copy()
     if "meta" in d:
         d["meta"] = {k: v for k, v in d["meta"].items() if k != "integrity_hash"}
 
-    canonical = json.dumps(d, sort_keys=True, separators=(",", ":"))
+    canonical = json.dumps(d, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def calculate_registry_hash(registry: dict) -> str:
     """Calculate SHA-256 hash of the registry for consistency tracking."""
-    canonical = json.dumps(registry, sort_keys=True, separators=(",", ":"))
+    canonical = json.dumps(registry, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def write_atomic_json(path: Path, data: dict):
-    """Write JSON data atomically to prevent corruption.
-
-    Uses tempfile + os.replace for atomic operation,
-    followed by fsync for durability.
-    """
+    """Write JSON data atomically to prevent corruption."""
     path.parent.mkdir(parents=True, exist_ok=True)
 
     fd, tmp = tempfile.mkstemp(
@@ -128,10 +131,8 @@ def write_atomic_json(path: Path, data: dict):
             f.flush()
             os.fsync(f.fileno())
 
-        # Atomic rename
         os.replace(tmp, str(path))
 
-        # Directory fsync for metadata durability
         try:
             flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
             dfd = os.open(str(path.parent), flags)
@@ -160,6 +161,130 @@ def detect_binary_mode(eid: str, kind: str, profile: str) -> bool:
     return False
 
 
+# ─── Gatekeeper (Zombie-Sperre) ──────────────────────────────────────────────
+
+def fetch_gatekeeper_history(
+    session: requests.Session,
+    gatekeeper_entity: str,
+    start_dt: datetime,
+    end_dt: datetime,
+    ha_url: str,
+) -> Optional[List[Dict]]:
+    """Fetch history of the gatekeeper entity for the target period.
+
+    Returns None if the entity cannot be queried (non-fatal).
+    """
+    start_iso = start_dt.astimezone(ZoneInfo("UTC")).isoformat().replace("+00:00", "Z")
+    end_iso = end_dt.astimezone(ZoneInfo("UTC")).isoformat().replace("+00:00", "Z")
+
+    params = {
+        "filter_entity_id": gatekeeper_entity,
+        "end_time": end_iso,
+        "minimal_response": "1",
+        "no_attributes": "1",
+    }
+
+    try:
+        resp = session.get(
+            f"{ha_url}/api/history/period/{start_iso}",
+            params=params,
+            timeout=REQUEST_TIMEOUT,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            if data and len(data) > 0 and len(data[0]) > 0:
+                return data[0]
+            else:
+                logger.warning(
+                    f"Gatekeeper entity '{gatekeeper_entity}' returned empty history. "
+                    "Entity may not exist in HA. Gatekeeper enforcement skipped."
+                )
+                return None
+        else:
+            logger.warning(
+                f"Gatekeeper API returned status {resp.status_code} for '{gatekeeper_entity}'. "
+                "Gatekeeper enforcement skipped."
+            )
+            return None
+    except requests.exceptions.RequestException as e:
+        logger.warning(f"Gatekeeper fetch failed ({e}). Enforcement skipped.")
+        return None
+    except Exception as e:
+        logger.warning(f"Unexpected gatekeeper error ({e}). Enforcement skipped.")
+        return None
+
+
+def build_gatekeeper_slot_mask(
+    gk_events: List[Dict],
+    start_dt: datetime,
+) -> List[bool]:
+    """Build a boolean mask of 288 slots: True = data OK, False = gatekeeper was off/unavailable.
+
+    Uses LOCF (last-observation-carried-forward) identical to sensor slot mapping.
+    A gatekeeper state of "on" means infrastructure is healthy.
+    Any other state ("off", "unavailable", "unknown", "") → unhealthy → null the slot.
+    """
+    mask = [True] * SLOTS_PER_DAY
+
+    parsed = []
+    for e in gk_events:
+        state = e.get("state")
+        ts_str = e.get("last_changed")
+        if ts_str is None:
+            continue
+        try:
+            ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+            healthy = (str(state).lower() == "on")
+            parsed.append((ts, healthy))
+        except (ValueError, TypeError):
+            continue
+
+    parsed.sort(key=lambda x: x[0])
+
+    # Determine initial state (LOCF from events before start_dt)
+    event_idx = 0
+    last_known = True  # default: assume healthy if no prior data
+
+    while event_idx < len(parsed) and parsed[event_idx][0] <= start_dt:
+        last_known = parsed[event_idx][1]
+        event_idx += 1
+
+    curr_end = start_dt + timedelta(minutes=RASTER_MINUTES)
+    for i in range(SLOTS_PER_DAY):
+        slot_values = []
+
+        while event_idx < len(parsed) and parsed[event_idx][0] <= curr_end:
+            slot_values.append(parsed[event_idx][1])
+            last_known = parsed[event_idx][1]
+            event_idx += 1
+
+        mask[i] = slot_values[-1] if slot_values else last_known
+        curr_end += timedelta(minutes=RASTER_MINUTES)
+
+    return mask
+
+
+def apply_gatekeeper_mask(
+    timeseries: Dict[str, Any],
+    mask: List[bool],
+) -> int:
+    """Apply gatekeeper mask: null out sensor slots where mask is False.
+
+    Skips the 'ts_iso' key. Returns count of total nulled slots across all entities.
+    """
+    total_nulled = 0
+    for key, slots in timeseries.items():
+        if key == "ts_iso":
+            continue
+        if not isinstance(slots, list) or len(slots) != SLOTS_PER_DAY:
+            continue
+        for i in range(SLOTS_PER_DAY):
+            if not mask[i] and slots[i] is not None:
+                slots[i] = None
+                total_nulled += 1
+    return total_nulled
+
+
 # ─── Slot Mapping ─────────────────────────────────────────────────────────────
 
 def map_events_to_slots(
@@ -168,18 +293,10 @@ def map_events_to_slots(
     raw_policy: str,
     is_binary: bool,
 ) -> Tuple[List[Any], Dict]:
-    """Map Home Assistant events to 288 5-minute time slots.
-
-    For binary sensors, also calculates:
-    - total_open_seconds: Total time in "open" state
-    - toggle_count: Number of state changes
-
-    Returns: (slots, event_stats)
-    """
+    """Map Home Assistant events to 288 5-minute time slots."""
     slots = [None] * SLOTS_PER_DAY
     stats = {"total_open_seconds": 0, "toggle_count": 0}
 
-    # Parse and filter events
     parsed = []
     for e in events:
         state = e.get("state")
@@ -202,12 +319,11 @@ def map_events_to_slots(
 
     parsed.sort(key=lambda x: x[0])
 
-    # Binary sensor: Calculate open duration
     if is_binary and parsed:
         stats["toggle_count"] = len(parsed)
 
         last_ts = start_dt
-        last_val = 0  # Assume closed
+        last_val = 0
 
         prior_events = [e for e in parsed if e[0] <= start_dt]
         if prior_events:
@@ -223,14 +339,13 @@ def map_events_to_slots(
             last_ts = ts
             last_val = val
 
-        # Handle still-open at end of day
         if last_val == 1:
             effective_end = min(end_dt, datetime.now(start_dt.tzinfo))
             if last_ts < effective_end:
                 duration = (effective_end - last_ts).total_seconds()
                 stats["total_open_seconds"] += max(0, duration)
 
-    # Map to slots (LOCF - Last Observation Carried Forward)
+    # Map to slots (LOCF)
     event_idx = 0
     last_known = None
 
@@ -264,10 +379,7 @@ def fetch_history(
     ha_url: str,
     mode: str,
 ) -> Dict[str, List[Dict]]:
-    """Fetch history from Home Assistant API in batches.
-
-    Returns dict mapping entity_id -> event list.
-    """
+    """Fetch history from Home Assistant API in batches."""
     all_data = defaultdict(list)
 
     start_iso = start_dt.astimezone(ZoneInfo("UTC")).isoformat().replace("+00:00", "Z")
@@ -321,10 +433,7 @@ def fetch_history(
 # ─── Registry ─────────────────────────────────────────────────────────────────
 
 def load_registry(registry_path: str) -> Dict[str, Dict]:
-    """Load and validate registry.
-
-    Returns dict with only valid entities (have roals_id and exporter_domain).
-    """
+    """Load and validate registry."""
     if not os.path.exists(registry_path):
         logger.error(f"Registry not found: {registry_path}")
         sys.exit(1)
@@ -353,10 +462,7 @@ def load_registry(registry_path: str) -> Dict[str, Dict]:
 # ─── Date & Domain Parsing ────────────────────────────────────────────────────
 
 def parse_date_range(args) -> List:
-    """Parse date arguments into list of dates.
-
-    Supports: --start-date/--end-date (range), --date (single), default: yesterday.
-    """
+    """Parse date arguments into list of dates."""
     dates = []
 
     if args.start_date and args.end_date:
@@ -431,11 +537,7 @@ def process_daily_truth(
     start_dt: datetime,
     mode: str,
 ) -> Dict:
-    """Process daily truth mode: Generate 288-slot timeseries.
-
-    Returns dict with timeseries and summary.
-    """
-    # Generate timestamp grid
+    """Process daily truth mode: Generate 288-slot timeseries."""
     timeseries = {
         "ts_iso": [
             (start_dt + timedelta(minutes=RASTER_MINUTES * i)).isoformat()
@@ -463,7 +565,6 @@ def process_daily_truth(
         if is_binary and stats["toggle_count"] > 0:
             event_metrics[entity_id] = stats
 
-    # ── PATCH 2 (V2.8): Summary only for real entities, not ts_iso ──
     summary = {"columns": {}}
     for entity_id in entities.keys():
         slots = timeseries.get(entity_id, [])
@@ -489,8 +590,9 @@ def main():
         description=f"ROALS Exporter A — {VERSION}",
     )
 
-    # Paths
-    parser.add_argument("--registry", default="registry.json", help="Path to entity_registry.json")
+    # Paths — V2.8.1: Fixed default to entity_registry.json
+    parser.add_argument("--registry", default="entity_registry.json",
+                        help="Path to entity_registry.json")
     parser.add_argument("--out", default="data", help="Output directory")
 
     # Date selection
@@ -506,11 +608,19 @@ def main():
     parser.add_argument("--timezone", default="Asia/Manila", help="Target timezone")
     parser.add_argument("--mode", default="daily_truth", help="Export mode (daily_truth or raw)")
 
+    # Gatekeeper
+    parser.add_argument("--gatekeeper-entity", default="binary_sensor.eg_data_ingest_ok",
+                        help="Entity ID for ingest-infrastructure health check")
+    parser.add_argument("--enforce-gatekeeper", action="store_true", default=True,
+                        help="Enforce gatekeeper zombie-data nulling (default: True)")
+    parser.add_argument("--no-gatekeeper", dest="enforce_gatekeeper", action="store_false",
+                        help="Disable gatekeeper enforcement")
+
     args = parser.parse_args()
 
     # ── Home Assistant Add-on: Load options.json ──
     options_path = Path("/data/options.json")
-    local_options = Path("options.json")  # Cockpit writes this for local mode
+    local_options = Path("options.json")
     ha_url = "http://localhost:8123"
 
     active_options = None
@@ -545,6 +655,12 @@ def main():
                 args.end_date = options["end_date"]
             elif options.get("target_date"):
                 args.date = options["target_date"]
+
+            # Gatekeeper config from options
+            if options.get("gatekeeper_entity"):
+                args.gatekeeper_entity = options["gatekeeper_entity"]
+            if "enforce_gatekeeper" in options:
+                args.enforce_gatekeeper = options["enforce_gatekeeper"]
 
         except (OSError, json.JSONDecodeError) as e:
             logger.error(f"Error loading {active_options}: {e}")
@@ -594,7 +710,6 @@ def main():
 
             logger.info(f"  {len(domain_entities)} entities in {domain}")
 
-            # Fetch history (30 min before start to catch initial state)
             history = fetch_history(
                 session,
                 list(domain_entities.keys()),
@@ -604,7 +719,36 @@ def main():
                 args.mode,
             )
 
-            # ── PATCH 1 + 3 (V2.8): Full meta block with generated_at, version, window ──
+            # ── Gatekeeper: fetch and build mask ──
+            gk_active = False
+            gk_mask = None
+            gk_slots_nulled = 0
+
+            if args.enforce_gatekeeper and args.mode == "daily_truth":
+                gk_events = fetch_gatekeeper_history(
+                    session,
+                    args.gatekeeper_entity,
+                    start_dt - timedelta(minutes=30),
+                    end_dt,
+                    ha_url,
+                )
+                if gk_events is not None:
+                    gk_mask = build_gatekeeper_slot_mask(gk_events, start_dt)
+                    gk_active = True
+                    blocked_slots = sum(1 for v in gk_mask if not v)
+                    if blocked_slots > 0:
+                        logger.info(
+                            f"  Gatekeeper: {blocked_slots}/{SLOTS_PER_DAY} slots marked unhealthy "
+                            f"({round(blocked_slots / SLOTS_PER_DAY * 100, 1)}%)"
+                        )
+                    else:
+                        logger.info("  Gatekeeper: all slots healthy")
+                else:
+                    logger.warning(
+                        f"  Gatekeeper: could not verify '{args.gatekeeper_entity}' — "
+                        "proceeding without enforcement"
+                    )
+
             meta = {
                 "version": SCHEMA_VERSION,
                 "mode": args.mode,
@@ -614,6 +758,8 @@ def main():
                 "generated_at": datetime.now(tz).isoformat(),
                 "system_id": os.getenv("HOSTNAME", "unknown"),
                 "registry_hash": reg_hash,
+                "gatekeeper_active": gk_active,
+                "gatekeeper_entity": args.gatekeeper_entity if args.enforce_gatekeeper else None,
                 "window": {
                     "start": start_dt.isoformat(),
                     "end": end_dt.isoformat(),
@@ -629,9 +775,25 @@ def main():
                 },
             }
 
-            # Process based on mode
             if args.mode == "daily_truth":
                 result = process_daily_truth(domain_entities, history, start_dt, args.mode)
+
+                # Apply gatekeeper mask: null out slots where infrastructure was unhealthy
+                if gk_active and gk_mask is not None:
+                    gk_slots_nulled = apply_gatekeeper_mask(result["timeseries"], gk_mask)
+                    if gk_slots_nulled > 0:
+                        logger.info(f"  Gatekeeper nulled {gk_slots_nulled} sensor-slot values")
+
+                        # Recalculate summary after nulling
+                        for entity_id in domain_entities.keys():
+                            slots = result["timeseries"].get(entity_id, [])
+                            valid_count = sum(1 for v in slots if v is not None)
+                            coverage_pct = round((valid_count / SLOTS_PER_DAY) * 100, 1)
+                            result["summary"]["columns"][entity_id]["valid_count"] = valid_count
+                            result["summary"]["columns"][entity_id]["coverage_pct"] = coverage_pct
+
+                meta["gatekeeper_slots_nulled"] = gk_slots_nulled
+
                 payload = {
                     "meta": meta,
                     **result,
@@ -642,10 +804,8 @@ def main():
                     "raw_data": history,
                 }
 
-            # ── PATCH 4 (V2.8): Hash covers entire payload including generated_at ──
             payload["meta"]["integrity_hash"] = calculate_integrity_hash(payload)
 
-            # Write file
             folder = "daily" if args.mode == "daily_truth" else "raw"
             output_path = Path(args.out) / folder / domain / f"{date}_{domain}.json"
 
@@ -657,10 +817,10 @@ def main():
                 files_failed += 1
                 logger.error(f"  Failed to write {output_path}: {e}")
 
-    # Final summary
     logger.info("=" * 60)
     logger.info(f"ROALS Exporter {VERSION} — Complete")
     logger.info(f"  Files written: {files_written}")
+    logger.info(f"  Gatekeeper:    {'ENFORCED' if args.enforce_gatekeeper else 'DISABLED'} ({args.gatekeeper_entity})")
     if files_failed > 0:
         logger.warning(f"  Files failed:  {files_failed}")
     logger.info("=" * 60)
